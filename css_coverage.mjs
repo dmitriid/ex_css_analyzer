@@ -112,6 +112,8 @@
  *     {type:"either", values:[...]})
  *   - permutations: array of arrays — each inner array is one possible
  *     combination of classes the element could have at runtime
+ *   - repeat: whether the element comes from a HEEx :for and may render
+ *     multiple sibling copies of itself
  *   - children: nested child nodes with the same structure
  *
  * DYNAMIC ENTRIES: Objects with {dynamic: true, reason, expr, chain} can
@@ -146,7 +148,8 @@
  *      permutation satisfying the segment's classes.
  *    - Child combinator (">"): the IMMEDIATE parent must satisfy the segment.
  *    - Adjacent sibling combinator ("+"): a sibling node (another child of
- *      the same parent) must satisfy the segment.
+ *      the same parent), or another rendered copy of the same repeatable
+ *      node, must satisfy the segment.
  *    - General sibling combinator ("~"): same as "+", any sibling works.
  *
  *    "Satisfies a segment" means: does any permutation of that node contain
@@ -789,7 +792,7 @@ function matchSelectorLeftward(segments, candidateEntry) {
       let siblingNodes;
       if (segIdx === segments.length - 2) {
         // Siblings of the candidate node itself
-        siblingNodes = siblings;
+        siblingNodes = node.repeat ? [...siblings, node] : siblings;
       } else {
         // Siblings of the ancestor we're currently at
         if (ancestorIdx >= 0 && ancestorIdx < ancestors.length) {

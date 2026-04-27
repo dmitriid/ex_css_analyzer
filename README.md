@@ -167,6 +167,7 @@ After classes are extracted we create all possible combinations of these classes
                 "mb-2",
                 "font-medium"
               ],
+              "repeat": false,
               "children": [],
               "variants": [],
               "permutations": [
@@ -202,6 +203,11 @@ After classes are extracted we create all possible combinations of these classes
 ```
 
 We do this to make sure that we know that CSS selector `class1.class2` catches `class1 class2 class3`.
+
+**Added by LLM:** Elements with HEEx `:for` get `"repeat": true` in the analysis output. That
+metadata means one template node may render multiple sibling elements, so CSS
+coverage can match direct sibling selectors such as `.note + .note` or
+`.note ~ .note` against `<p :for={line <- @lines} class="note">`.
 
 We do this for every module, and save analysis of every module in `analysis/<ModuleName>.json`. Take a look, there's more info than just in this simplified description. Example:
 
@@ -287,6 +293,12 @@ This script parses `app.css` with PostCSS, loads analysis made by the mix task a
 The result is output to `analysis/css-coverage.json`.
 
 It will contain which selectors have been matched, skipped or unmatched, and why.
+
+**Added by LLM:** Sibling combinators are matched structurally where possible. For `+` and `~`,
+the matcher checks sibling nodes with the same parent. If the current node has
+`"repeat": true`, it also treats another rendered copy of that node as a direct
+sibling, which covers repeated HEEx nodes without pretending arbitrary
+descendants are siblings.
 
 Examples:
 

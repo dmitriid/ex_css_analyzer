@@ -91,17 +91,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
             do: [func_info.heex],
             else: heex_list
 
-        heex_list
-        |> Enum.with_index()
-        |> Enum.map(fn {heex, idx} ->
-          label =
-            if length(heex_list) > 1,
-              do: "#{func_info.name}/#{func_info.arity}##{idx + 1}",
-              else: "#{func_info.name}/#{func_info.arity}"
-
-          tree = parse_and_resolve(heex, calling_module, registry)
-          {label, tree}
-        end)
+        resolve_heex_clauses(heex_list, func_info, calling_module, registry)
       end)
 
     template_results =
@@ -112,6 +102,20 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
       end)
 
     function_results ++ template_results
+  end
+
+  defp resolve_heex_clauses(heex_list, func_info, calling_module, registry) do
+    heex_list
+    |> Enum.with_index()
+    |> Enum.map(fn {heex, idx} ->
+      label =
+        if length(heex_list) > 1,
+          do: "#{func_info.name}/#{func_info.arity}##{idx + 1}",
+          else: "#{func_info.name}/#{func_info.arity}"
+
+      tree = parse_and_resolve(heex, calling_module, registry)
+      {label, tree}
+    end)
   end
 
   # --- Core pipeline ---
@@ -156,6 +160,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
       static: all_statics,
       variants: resolved_variants,
       permutations: permutations,
+      repeat: node.repeat,
       children: all_children
     }
   end

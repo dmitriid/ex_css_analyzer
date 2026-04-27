@@ -15,8 +15,10 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
   structs. At this stage, nodes have their `tag` and `static` fields populated.
   The `static` field contains the raw class attribute value -- either a plain
   string for static classes, an `{:expr, code}` tuple for dynamic expressions,
-  or an empty list if no class attribute is present. Later pipeline stages
-  (Resolver/Expression) analyze these values further.
+  or an empty list if no class attribute is present. Nodes with HEEx `:for`
+  also get `repeat: true`, preserving the fact that one template node may
+  render multiple sibling elements. Later pipeline stages (Resolver/Expression)
+  analyze these values further.
 
   ## Public API
 
@@ -34,6 +36,9 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
 
       iex> HeexParser.parse(~S(<img src="x.png" class="w-full" />))
       [%Node{tag: "img", static: "w-full", children: []}]
+
+      iex> HeexParser.parse(~S(<p :for={line <- @lines} class="note">...</p>))
+      [%Node{tag: "p", static: "note", repeat: true, children: []}]
 
   ## Parsing Details
 
@@ -59,9 +64,10 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
 
   - A plain string for `class="static classes"`
   - An `{:expr, code}` tuple for `class={dynamic_expression}`
+  - `repeat: true` metadata for elements with HEEx `:for`
   - `true` for boolean attributes (no value)
-  - Only the `class` attribute is preserved in the output nodes; other
-    attributes are discarded.
+  - Only `class` and the presence of `:for` are preserved in the output nodes;
+    other attributes are discarded.
 
   ### Void Elements
 
@@ -558,6 +564,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
     %Node{
       tag: tag,
       static: class_value,
+      repeat: repeat?(attrs),
       children: children
     }
   end
@@ -570,4 +577,6 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
       _ -> []
     end
   end
+
+  defp repeat?(attrs), do: Map.has_key?(attrs, ":for")
 end

@@ -51,6 +51,9 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
   - `:children` - A list of child `Node` structs forming the tree hierarchy.
     Corresponds to elements nested within this element in the HEEX template.
 
+  - `:repeat` - Whether the element has a HEEx `:for` attribute and may render
+    multiple sibling copies of itself.
+
   ## Examples
 
       # A simple div with static classes
@@ -90,12 +93,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
           static: [class_value()],
           variants: [variant()],
           permutations: [[String.t()]],
-          children: [t()]
+          children: [t()],
+          repeat: boolean()
         }
 
   defstruct tag: nil,
             static: [],
             variants: [],
             permutations: [],
-            children: []
+            children: [],
+            repeat: false
 end
