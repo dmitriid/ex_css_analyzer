@@ -66,9 +66,13 @@
  * names are checked against animation/animation-name properties in the CSS.
  *
  * For each CSS rule node, postcss-selector-parser decomposes the selector
- * into its constituent parts. Pseudo-classes (:hover, :focus, :first-child,
- * :not(), :where(), etc.) and pseudo-elements (::before, ::after) are stripped
- * because they don't affect class-based matching.
+ * into its constituent parts. State-only pseudo-classes (:hover, :focus, etc.)
+ * and pseudo-elements (::before, ::after) don't contribute classes. Classless
+ * structural selector pieces such as `:not(...)`, `:has(...)`, `:is(...)`,
+ * tags, attributes, and `*` are preserved as wildcard segments when they sit
+ * between classed selector pieces. This keeps combinator structure intact for
+ * selectors like `.stack > * + *` and `.x > :not(.a) .b` without trying to
+ * prove the inner pseudo condition.
  *
  * Each selector is decomposed into an ordered list of "segments", where each
  * segment has:
@@ -76,10 +80,13 @@
  *   - combinator: the combinator that connects this segment to the previous
  *     one (null for the first segment, " " for descendant, ">" for child,
  *     "+" for adjacent sibling, "~" for general sibling)
+ *   - wildcard: true for classless structural segments that can match any
+ *     analyzed node but still enforce their combinator
  *
  * Example decompositions:
  *   `.a.b > .c`  →  [{classes:["a","b"], combinator:null}, {classes:["c"], combinator:">"}]
  *   `.event-page .event-hero__title`  →  [{classes:["event-page"], combinator:null}, {classes:["event-hero__title"], combinator:" "}]
+ *   `.x > :not(.a) .b` → [{classes:["x"], combinator:null}, {classes:[], combinator:">", wildcard:true}, {classes:["b"], combinator:" "}]
  *
  * Comma-separated selectors like `.input, .select, .textarea {}` are split
  * into independent selectors, each evaluated separately — if `.input` matches
@@ -126,23 +133,28 @@
  *
  * An index is built: classToNodes maps each class name to a list of entries
  * containing the module, source file, function name, node reference, ancestor
- * chain, and sibling nodes. This allows efficient lookup during matching.
+ * chain, and sibling nodes. A separate allEntries list is kept for selectors
+ * whose rightmost segment is classless (for example `.stack > * + *`).
  *
  * Phase 3: Match Selectors (Right-to-Left)
  * -----------------------------------------
  * CSS selectors are matched right-to-left, mirroring how browser engines
  * evaluate selectors. For each parsed selector:
  *
- * 1. Start from the RIGHTMOST segment (the "key selector").
+ * 1. Start from the RIGHTMOST segment (the "key selector"). If that segment is
+ *    classless/wildcard, all analyzed nodes are potential candidates.
  *
  * 2. Find all tree nodes where at least one permutation contains ALL classes
  *    required by that segment. A permutation is a list of class strings;
  *    we check if any single permutation is a superset of the required classes.
  *    If a permutation entry is "<dynamic>", the node COULD match any class.
+ *    Wildcard segments match any analyzed node.
  *
- * 3. For each candidate node from step 2, walk LEFT through the remaining
- *    selector segments, checking combinator constraints against the node's
- *    ancestor chain and siblings:
+ * 3. For each candidate node from step 2, recursively walk LEFT through the
+ *    remaining selector segments, checking combinator constraints against the
+ *    node's ancestor chain and siblings. Recursion lets wildcard/descendant
+ *    segments try every valid ancestor position instead of greedily accepting
+ *    the nearest one:
  *
  *    - Descendant combinator (" "): ANY ancestor in the chain must have a
  *      permutation satisfying the segment's classes.
@@ -153,7 +165,7 @@
  *    - General sibling combinator ("~"): same as "+", any sibling works.
  *
  *    "Satisfies a segment" means: does any permutation of that node contain
- *    ALL classes in the segment?
+ *    ALL classes in the segment? Wildcard segments satisfy any analyzed node.
  *
  * 4. Results are categorized:
  *    - matched: all segments satisfied statically, with full provenance.
@@ -468,7 +480,27 @@ function extractSegments(selectorNode) {
   const segments = [];
   let currentClasses = [];
   let currentCombinator = null;
+  let currentHasClasslessStructure = false;
   let hasAnyClass = false;
+
+  function flushCurrentSegment() {
+    if (currentClasses.length > 0) {
+      segments.push({
+        classes: currentClasses,
+        combinator: currentCombinator,
+        wildcard: false,
+      });
+    } else if (currentHasClasslessStructure && currentCombinator !== null) {
+      segments.push({
+        classes: [],
+        combinator: currentCombinator,
+        wildcard: true,
+      });
+    }
+
+    currentClasses = [];
+    currentHasClasslessStructure = false;
+  }
 
   for (const node of selectorNode.nodes) {
     switch (node.type) {
@@ -479,13 +511,7 @@ function extractSegments(selectorNode) {
 
       case "combinator": {
         // Flush current segment
-        if (currentClasses.length > 0) {
-          segments.push({
-            classes: currentClasses,
-            combinator: currentCombinator,
-          });
-          currentClasses = [];
-        }
+        flushCurrentSegment();
         currentCombinator = node.value.trim() || " ";
         break;
       }
@@ -496,11 +522,13 @@ function extractSegments(selectorNode) {
       case "universal":
         // We ignore these for matching, but they create segment boundaries
         // if followed by a combinator. We keep accumulating classes.
+        currentHasClasslessStructure = true;
         break;
 
       case "pseudo":
         // Skip pseudo-classes and pseudo-elements entirely.
         // Don't descend into :not(), :where(), etc.
+        currentHasClasslessStructure = true;
         break;
 
       case "selector":
@@ -513,14 +541,13 @@ function extractSegments(selectorNode) {
   }
 
   // Flush last segment
-  if (currentClasses.length > 0) {
-    segments.push({ classes: currentClasses, combinator: currentCombinator });
-  }
+  flushCurrentSegment();
 
   if (!hasAnyClass) return null;
 
-  // Filter out empty segments (can happen with element-only parts)
-  return segments.filter((s) => s.classes.length > 0);
+  // Keep wildcard segments between classed segments because they preserve
+  // structural combinators like `.x > :not(...) .y`.
+  return segments.filter((s) => s.wildcard || s.classes.length > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -586,6 +613,7 @@ function nodeLabel(node) {
  */
 function loadAnalysisTrees(analysisDir) {
   const classToNodes = new Map();
+  const allEntries = [];
   const files = readdirSync(analysisDir).filter(
     (f) => f.endsWith(".json") && f !== "css-coverage.json"
   );
@@ -631,6 +659,8 @@ function loadAnalysisTrees(analysisDir) {
           hasDynamic,
         };
 
+        allEntries.push(entry);
+
         for (const cls of allClasses) {
           if (isDynamic(cls)) continue;
           if (!classToNodes.has(cls)) classToNodes.set(cls, []);
@@ -640,6 +670,7 @@ function loadAnalysisTrees(analysisDir) {
     }
   }
 
+  classToNodes.allEntries = allEntries;
   return classToNodes;
 }
 
@@ -682,6 +713,7 @@ function collectNodeClasses(node) {
  *   false     — not matched at all
  */
 function nodeMatchesSegment(node, requiredClasses) {
+  if (requiredClasses.length === 0) return "static";
   if (!node.permutations) return false;
 
   let bestDynamic = false;
@@ -704,6 +736,11 @@ function nodeMatchesSegment(node, requiredClasses) {
   return bestDynamic ? "dynamic" : false;
 }
 
+function nodeMatchesParsedSegment(node, segment) {
+  if (segment.wildcard) return "static";
+  return nodeMatchesSegment(node, segment.classes);
+}
+
 /**
  * Given a candidate node and its ancestor chain, walk left through the
  * selector segments (from right-to-left) to check if the full selector
@@ -712,127 +749,81 @@ function nodeMatchesSegment(node, requiredClasses) {
  * Returns: { matched: boolean, dynamic: boolean, dynamicNode: object|null, unmatchedClasses: string[] }
  */
 function matchSelectorLeftward(segments, candidateEntry) {
-  // segments[segments.length - 1] is the rightmost (already matched against candidateEntry.node)
-  // We need to walk segments from right-to-left starting at index segments.length - 2
+  return matchSegmentAt(
+    segments,
+    segments.length - 1,
+    candidateEntry.node,
+    candidateEntry.ancestors,
+    false,
+    null
+  );
+}
 
-  const { node, ancestors, siblings } = candidateEntry;
-
-  // If there's only one segment, we're done
-  if (segments.length === 1) {
-    return { matched: true, dynamic: false, dynamicNode: null, unmatchedClasses: [] };
+function matchSegmentAt(segments, segIdx, node, ancestors, involvesDynamic, dynamicNode) {
+  if (segIdx === 0) {
+    return { matched: true, dynamic: involvesDynamic, dynamicNode, unmatchedClasses: [] };
   }
 
-  let involvesDynamic = false;
-  let dynamicNode = null;
-  // The ancestors array goes from root → immediate parent
-  // We'll maintain a pointer into the ancestor chain
-  let ancestorIdx = ancestors.length - 1; // start from immediate parent
+  const leftSeg = segments[segIdx - 1];
+  const comb = segments[segIdx].combinator;
+  const candidates = relatedCandidates(comb, node, ancestors);
+  let dynamicFailure = null;
 
-  for (let segIdx = segments.length - 2; segIdx >= 0; segIdx--) {
-    const seg = segments[segIdx];
-    const nextSeg = segments[segIdx + 1]; // the segment to the right (already matched)
-    const combinator = nextSeg.combinator || seg.combinator;
+  for (const candidate of candidates) {
+    const matchResult = nodeMatchesParsedSegment(candidate.node, leftSeg);
 
-    // Determine which combinator connects this segment to the already-matched one
-    // The combinator is stored on the RIGHT segment (the one closer to the key selector)
-    // Actually, in our segment model, the combinator on segments[i] describes how
-    // segments[i] connects to segments[i-1]. Wait, let me re-check:
-    // Our extractSegments builds segments left-to-right, with the combinator on each
-    // segment describing how it connects to the PREVIOUS segment.
-    // So segments[segIdx+1].combinator tells us how segIdx+1 relates to segIdx.
-    const comb = segments[segIdx + 1].combinator;
+    if (matchResult === "static" || matchResult === "dynamic") {
+      const nextDynamic = involvesDynamic || matchResult === "dynamic";
+      const nextDynamicNode =
+        matchResult === "dynamic" ? dynamicNode || candidate.node : dynamicNode;
 
-    if (comb === ">") {
-      if (ancestorIdx < 0) {
-        return { matched: false, dynamic: involvesDynamic, dynamicNode, unmatchedClasses: seg.classes };
-      }
-      const parentNode = ancestors[ancestorIdx];
-      const matchResult = nodeMatchesSegment(parentNode, seg.classes);
-      if (matchResult === "static") {
-        ancestorIdx--;
-        continue;
-      } else if (matchResult === "dynamic") {
-        involvesDynamic = true;
-        dynamicNode = dynamicNode || parentNode;
-        ancestorIdx--;
-        continue;
-      } else {
-        return { matched: false, dynamic: involvesDynamic, dynamicNode, unmatchedClasses: seg.classes };
-      }
-    }
+      const result = matchSegmentAt(
+        segments,
+        segIdx - 1,
+        candidate.node,
+        candidate.ancestors,
+        nextDynamic,
+        nextDynamicNode
+      );
 
-    if (comb === " " || comb === undefined || comb === null) {
-      let found = false;
-      while (ancestorIdx >= 0) {
-        const anc = ancestors[ancestorIdx];
-        const matchResult = nodeMatchesSegment(anc, seg.classes);
-        if (matchResult === "static") {
-          ancestorIdx--;
-          found = true;
-          break;
-        } else if (matchResult === "dynamic") {
-          involvesDynamic = true;
-          dynamicNode = dynamicNode || anc;
-          ancestorIdx--;
-          found = true;
-          break;
-        }
-        ancestorIdx--;
-      }
-      if (!found) {
-        return { matched: false, dynamic: involvesDynamic, dynamicNode, unmatchedClasses: seg.classes };
-      }
-      continue;
-    }
-
-    if (comb === "+" || comb === "~") {
-      // Sibling combinator: a sibling of the current node (or its ancestor at this level)
-      // must satisfy the segment
-      // For simplicity, we check siblings of the node at the current ancestor level
-      let siblingNodes;
-      if (segIdx === segments.length - 2) {
-        // Siblings of the candidate node itself
-        siblingNodes = node.repeat ? [...siblings, node] : siblings;
-      } else {
-        // Siblings of the ancestor we're currently at
-        if (ancestorIdx >= 0 && ancestorIdx < ancestors.length) {
-          // Get the parent of the current ancestor to find siblings
-          const currentAncestor = ancestors[ancestorIdx];
-          const parentOfCurrent =
-            ancestorIdx > 0 ? ancestors[ancestorIdx - 1] : null;
-          if (parentOfCurrent && parentOfCurrent.children) {
-            siblingNodes = parentOfCurrent.children.filter(
-              (c) => c !== currentAncestor
-            );
-          } else {
-            siblingNodes = [];
-          }
-        } else {
-          siblingNodes = [];
-        }
-      }
-
-      let found = false;
-      for (const sib of siblingNodes || []) {
-        const matchResult = nodeMatchesSegment(sib, seg.classes);
-        if (matchResult === "static") {
-          found = true;
-          break;
-        } else if (matchResult === "dynamic") {
-          involvesDynamic = true;
-          dynamicNode = dynamicNode || sib;
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        return { matched: false, dynamic: involvesDynamic, dynamicNode, unmatchedClasses: seg.classes };
-      }
-      continue;
+      if (result.matched) return result;
+      if (result.dynamic) dynamicFailure = result;
     }
   }
 
-  return { matched: true, dynamic: involvesDynamic, dynamicNode, unmatchedClasses: [] };
+  if (dynamicFailure) return dynamicFailure;
+
+  return {
+    matched: false,
+    dynamic: involvesDynamic,
+    dynamicNode,
+    unmatchedClasses: leftSeg.classes,
+  };
+}
+
+function relatedCandidates(comb, node, ancestors) {
+  if (comb === ">") {
+    if (ancestors.length === 0) return [];
+    const parentIdx = ancestors.length - 1;
+    return [{ node: ancestors[parentIdx], ancestors: ancestors.slice(0, parentIdx) }];
+  }
+
+  if (comb === "+" || comb === "~") {
+    const parent = ancestors[ancestors.length - 1];
+    const siblings = parent && parent.children ? parent.children.filter((c) => c !== node) : [];
+    const siblingNodes = node.repeat ? [...siblings, node] : siblings;
+
+    return siblingNodes.map((sibling) => ({
+      node: sibling,
+      ancestors,
+    }));
+  }
+
+  const candidates = [];
+  for (let idx = ancestors.length - 1; idx >= 0; idx--) {
+    candidates.push({ node: ancestors[idx], ancestors: ancestors.slice(0, idx) });
+  }
+  return candidates;
 }
 
 /**
@@ -1137,7 +1128,7 @@ function findCandidatesForSegment(requiredClasses, classToNodes) {
   // Use the first required class to narrow down candidates
   const candidates = new Set();
 
-  if (requiredClasses.length === 0) return [];
+  if (requiredClasses.length === 0) return classToNodes.allEntries || [];
 
   // Gather candidates from all required classes (union) so that nodes with
   // partial static + dynamic coverage are included

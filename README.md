@@ -300,6 +300,17 @@ the matcher checks sibling nodes with the same parent. If the current node has
 sibling, which covers repeated HEEx nodes without pretending arbitrary
 descendants are siblings.
 
+**Added by LLM:** Classless structural selector pieces are preserved as wildcard
+segments instead of being dropped. This covers selectors such as
+`.event-page > :not(.ignored) .target`, `.event-page > :has(.thing) .target`,
+`.event-page > :is(section, article) .target`, and `.stack > * + *`.
+
+The matcher is conservative: it does not try to prove the inner `:not()`,
+`:has()`, or `:is()` condition. It only keeps the required structural hop and
+combinator, then verifies the surrounding classed segments against the HEEX
+tree. This prevents `.x > :not(...) .b` from collapsing into `.x .b`, which
+would otherwise create false matches.
+
 Examples:
 
 ```
@@ -553,4 +564,8 @@ not all permutations are calculated. I was wrong, I need not permutations of all
 
 ```
 one issue. selectors like `.class1 .class2` can match any depth of the child with .class2
+```
+
+```
+`mix heex_class_analyzer` and `node lib/mix/tasks/css_coverage.mjs` are probably missing the nested selectorts that have `> :not(something)` or `> :has(something)` or `:is(something)` and similar like `+`, just child selectors like `.x > :not(:a) .b` etc.
 ```
