@@ -9,7 +9,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
 
   ## Pipeline Role
 
-      Discovery -> **HeexParser** -> Expression -> Registry -> Resolver -> Permutations -> Output
+      Discovery -> **HeexParser** -> Expression -> Registry -> Resolver -> ClassFacts -> Output
 
   The `HeexParser` receives a HEEX string and returns a list of root `Node`
   structs. At this stage, nodes have their `tag` and `static` fields populated.
@@ -114,7 +114,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
     `.heex` files, or `render/1` functions).
   - **Output**: `[Node.t()]` consumed by `Resolver`, which calls
     `Expression.analyze/1` on each node's `static` field and then
-    `Permutations.compute/2` to fill in the remaining node fields.
+    `ClassFacts.from_static_and_variants/2` to fill in compact class facts.
   """
 
   alias Mix.Tasks.HeexClassAnalyzer.Node
@@ -171,8 +171,12 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
 
   # HEEX expression: {expr} — skip entire expression block
   defp tokenize("{" <> rest, acc) do
-    {_expr, remaining} = read_brace_expression(rest, 1, "")
-    tokenize(remaining, acc)
+    {expr, remaining} = read_brace_expression(rest, 1, "")
+
+    case render_slot_name(expr) do
+      nil -> tokenize(remaining, [{:self_close, expression_tag(expr), %{}} | acc])
+      slot_name -> tokenize(remaining, [{:self_close, "__slot__:#{slot_name}", %{}} | acc])
+    end
   end
 
   # Opening tag: <tag ...> or <tag ... />
@@ -309,8 +313,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
   defp parse_attr_name(input), do: parse_attr_name(input, "")
 
   defp parse_attr_name(<<c, rest::binary>>, acc)
-       when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?- or c == ?_ or c == ?: or
-              c == ?@ or c == ?. do
+       when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?- or c == ?_ or c == ?: or c == ?@ or c == ?. do
     parse_attr_name(rest, acc <> <<c>>)
   end
 
@@ -477,6 +480,38 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
 
   defp void_element?(tag), do: tag in @void_elements
 
+  defp expression_tag(expr) do
+    encoded = Base.url_encode64(expr, padding: false)
+    "__expr__:#{encoded}"
+  end
+
+  defp render_slot_name(expr) when is_binary(expr) do
+    expr = String.trim_leading(expr)
+
+    if String.starts_with?(expr, "render_slot") do
+      parse_render_slot_name(expr)
+    end
+  end
+
+  defp parse_render_slot_name(expr) do
+    with {:ok, ast} <- Code.string_to_quoted(expr, emit_warnings: false),
+         {:ok, name} <- render_slot_name_from_ast(ast) do
+      Atom.to_string(name)
+    else
+      _ -> nil
+    end
+  end
+
+  defp render_slot_name_from_ast({:render_slot, _, [{{:., _, [{:assigns, _, _}, name]}, _, []}]}) when is_atom(name) do
+    {:ok, name}
+  end
+
+  defp render_slot_name_from_ast({:render_slot, _, [{:@, _, [{name, _, _}]}]}) when is_atom(name) do
+    {:ok, name}
+  end
+
+  defp render_slot_name_from_ast(_ast), do: :error
+
   # --- Tree builder ---
 
   # Builds a tree from the flat token list using a stack.
@@ -539,7 +574,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
 
   defp pop_to_matching(tag, [{tag, attrs, children} | rest], orphans) do
     # The orphans (unclosed intermediate tags) become children of this element
-    all_children = Enum.reverse(orphans) ++ children
+    all_children = Enum.reverse(orphans, children)
     {attrs, all_children, rest}
   end
 

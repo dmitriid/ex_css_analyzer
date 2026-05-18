@@ -5,7 +5,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
 
   This is the first stage of the analyzer pipeline:
 
-      **Discovery** -> HeexParser -> Expression -> Registry -> Resolver -> Permutations -> Output
+      **Discovery** -> HeexParser -> Expression -> Registry -> Resolver -> ClassFacts -> Output
 
   ## Purpose
 
@@ -76,6 +76,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   | `arity`   | `non_neg_integer()`     | Number of parameters                                     |
   | `body`    | `Macro.t()`             | AST of the first clause's body                           |
   | `heex`    | `String.t() \\| nil`    | Extracted `~H` sigil content (interpolations as `{...}`) |
+  | `heex_assign_facts` | `[map()]`       | Per-HEEX-clause assign facts visible before the sigil    |
   | `clauses` | `[Macro.t()]`           | AST bodies of all function clauses                       |
 
   ## Edge Cases and Special Behaviors
@@ -109,6 +110,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
           arity: non_neg_integer(),
           body: Macro.t(),
           heex: String.t() | nil,
+          heex_assign_facts: [map()],
           clauses: [Macro.t()]
         }
 
@@ -131,6 +133,13 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
     heex_results = Enum.flat_map(heex_files, &parse_heex_file(&1, base_path, ex_results))
 
     ex_results ++ heex_results
+  end
+
+  if Mix.env() == :test do
+    @doc false
+    def parse_ex_content_for_test(content, relative_path) do
+      parse_ex_content(content, relative_path, File.cwd!())
+    end
   end
 
   # --- .ex file parsing ---
@@ -254,8 +263,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   defp alias_node?({:alias, _, [{{:., _, _}, _, _} | _]}), do: true
   defp alias_node?(_), do: false
 
-  defp extract_alias_entries({:alias, _, [{:__aliases__, _, parts}, opts]})
-       when is_list(opts) do
+  defp extract_alias_entries({:alias, _, [{:__aliases__, _, parts}, opts]}) when is_list(opts) do
     case Keyword.get(opts, :as) do
       {:__aliases__, _, [short]} ->
         [{short, Module.concat(parts)}]
@@ -272,9 +280,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   end
 
   # Multi-alias: alias Foo.{Bar, Baz}
-  defp extract_alias_entries(
-         {:alias, _, [{{:., _, [{:__aliases__, _, prefix}, :{}]}, _, suffixes}]}
-       ) do
+  defp extract_alias_entries({:alias, _, [{{:., _, [{:__aliases__, _, prefix}, :{}]}, _, suffixes}]}) do
     Enum.map(suffixes, fn {:__aliases__, _, suffix_parts} ->
       full = Module.concat(prefix ++ suffix_parts)
       short = List.last(suffix_parts)
@@ -318,13 +324,21 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
     |> Enum.map(fn {{name, arity}, clauses} ->
       bodies = Enum.map(clauses, fn {_name, _arity, body} -> body end)
       first_body = List.first(bodies)
-      all_heex = bodies |> Enum.map(&find_heex_in_ast/1) |> Enum.reject(&is_nil/1)
+
+      heex_clause_data =
+        bodies
+        |> Enum.map(&heex_clause_data/1)
+        |> Enum.reject(fn {heex, _facts} -> is_nil(heex) end)
+
+      all_heex = Enum.map(heex_clause_data, fn {heex, _facts} -> heex end)
+      all_heex_assign_facts = Enum.map(heex_clause_data, fn {_heex, facts} -> facts end)
 
       %{
         name: name,
         arity: arity,
         body: first_body,
         heex: List.first(all_heex),
+        heex_assign_facts: all_heex_assign_facts,
         heex_clauses: all_heex,
         clauses: bodies
       }
@@ -341,21 +355,25 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   defp function_def_node?({kind, _, _}) when kind in [:def, :defp], do: true
   defp function_def_node?(_), do: false
 
-  defp extract_function_def({kind, _, [{name, _, args}, [do: body]]})
-       when kind in [:def, :defp] and is_atom(name) do
-    arity = if is_list(args), do: length(args), else: 0
-    {name, arity, body}
-  end
-
   defp extract_function_def({kind, _, [{:when, _, [{name, _, args} | _]}, [do: body]]})
        when kind in [:def, :defp] and is_atom(name) do
     arity = if is_list(args), do: length(args), else: 0
     {name, arity, body}
   end
 
-  # One-liner: def foo(x), do: expr
-  defp extract_function_def({kind, _, [{name, _, args}]})
+  defp extract_function_def({kind, _, [{name, _, args}, [do: body]]}) when kind in [:def, :defp] and is_atom(name) do
+    arity = if is_list(args), do: length(args), else: 0
+    {name, arity, body}
+  end
+
+  defp extract_function_def({kind, _, [{:when, _, [{name, _, args} | _]}]})
        when kind in [:def, :defp] and is_atom(name) do
+    arity = if is_list(args), do: length(args), else: 0
+    {name, arity, nil}
+  end
+
+  # One-liner: def foo(x), do: expr
+  defp extract_function_def({kind, _, [{name, _, args}]}) when kind in [:def, :defp] and is_atom(name) do
     arity = if is_list(args), do: length(args), else: 0
     {name, arity, nil}
   end
@@ -363,6 +381,21 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   defp extract_function_def(_), do: nil
 
   # --- HEEX sigil extraction ---
+
+  defp heex_clause_data(nil), do: {nil, %{}}
+
+  defp heex_clause_data({:__block__, _, statements}) when is_list(statements) do
+    {before_heex, heex_and_after} = Enum.split_while(statements, &(not contains_heex_sigil?(&1)))
+
+    case heex_and_after do
+      [heex_ast | _] -> {find_heex_in_ast(heex_ast), extract_heex_assign_facts(before_heex)}
+      [] -> {nil, %{}}
+    end
+  end
+
+  defp heex_clause_data(ast) do
+    {find_heex_in_ast(ast), %{}}
+  end
 
   defp find_heex_in_ast(nil), do: nil
 
@@ -378,6 +411,30 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
 
   defp heex_sigil_node?({:sigil_H, _, _}), do: true
   defp heex_sigil_node?(_), do: false
+
+  defp contains_heex_sigil?(ast), do: not is_nil(find_first_node(ast, &heex_sigil_node?/1))
+
+  defp extract_heex_assign_facts(statements) do
+    Enum.reduce(statements, %{}, fn statement, acc ->
+      Map.merge(acc, assign_fact(statement))
+    end)
+  end
+
+  defp assign_fact({:=, _, [{:assigns, _, _}, {:|>, _, [_assigns_ast, {:assign, _, [assign_name_ast, expr_ast]}]}]}) do
+    assign_fact_from_name(assign_name_ast, expr_ast)
+  end
+
+  defp assign_fact({:=, _, [{:assigns, _, _}, {:assign, _, [{:assigns, _, _}, assign_name_ast, expr_ast]}]}) do
+    assign_fact_from_name(assign_name_ast, expr_ast)
+  end
+
+  defp assign_fact(_statement), do: %{}
+
+  defp assign_fact_from_name(assign_name, expr_ast) when is_atom(assign_name) do
+    %{assign_name => expr_ast}
+  end
+
+  defp assign_fact_from_name(_assign_name, _expr_ast), do: %{}
 
   defp extract_heex_string(parts) when is_list(parts) do
     Enum.map_join(parts, fn

@@ -4,24 +4,24 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
 
   A `Node` represents a single HTML or Phoenix component element in a parsed
   HEEX template tree. Each node carries the element's tag name, its CSS class
-  information (split into static classes and dynamic variants), the computed
-  permutations of all possible class combinations, and a list of child nodes
-  forming the tree structure.
+  information (split into static classes and dynamic variants), compact class
+  facts for selector matching, and a list of child nodes forming the tree
+  structure.
 
   ## Pipeline Role
 
   `Node` is the universal data structure flowing through the entire analyzer
   pipeline:
 
-      Discovery -> HeexParser -> Expression -> Registry -> Resolver -> Permutations -> Output
+      Discovery -> HeexParser -> Expression -> Registry -> Resolver -> Output
 
   - **HeexParser** produces `Node` trees with `tag` and `static` populated
     (where `static` may be a raw string, an `{:expr, code}` tuple, or a list).
   - **Resolver** enriches nodes by running `Expression.analyze/1` on the
     `static` field to populate `static` (as a list of class strings) and
     `variants`.
-  - **Permutations** fills in the `permutations` field with all possible class
-    combinations derived from static classes and variants.
+  - **Resolver** also fills in the `classes` field with compact class facts
+    derived from static classes and variants.
   - **Output** traverses the tree to render the final class hierarchy.
 
   ## Fields
@@ -44,12 +44,13 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
       (from `if/else`, `case`, `cond`, or `||` expressions). Exactly one of
       the options will be applied at runtime.
 
-  - `:permutations` - A list of class lists representing all possible
-    combinations of static and variant classes this element could have at
-    runtime. Computed by `Mix.Tasks.HeexClassAnalyzer.Permutations`.
+  - `:classes` - Compact class facts describing always-present static classes,
+    optional classes, mutually exclusive branch options, and dynamic class
+    sources.
 
-  - `:children` - A list of child `Node` structs forming the tree hierarchy.
-    Corresponds to elements nested within this element in the HEEX template.
+  - `:children` - A list of child `Node` structs or component edge refs
+    forming the tree hierarchy. Corresponds to elements nested within this
+    element in the HEEX template.
 
   - `:repeat` - Whether the element has a HEEx `:for` attribute and may render
     multiple sibling copies of itself.
@@ -61,7 +62,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
         tag: "div",
         static: ["flex", "items-center", "gap-2"],
         variants: [],
-        permutations: [["flex", "items-center", "gap-2"]],
+        classes: %{static: ["flex", "items-center", "gap-2"], optional: [], exclusive: [], dynamic: []},
         children: []
       }
 
@@ -70,7 +71,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
         tag: "button",
         static: ["btn"],
         variants: [{:toggle, "btn-active"}],
-        permutations: [["btn"], ["btn", "btn-active"]],
+        classes: %{static: ["btn"], optional: ["btn-active"], exclusive: [], dynamic: []},
         children: []
       }
 
@@ -79,7 +80,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
         tag: "span",
         static: ["font-bold"],
         variants: [{:either, ["text-green-500", "text-red-500"]}],
-        permutations: [["font-bold", "text-green-500"], ["font-bold", "text-red-500"]],
+        classes: %{static: ["font-bold"], optional: [], exclusive: [[["text-green-500"], ["text-red-500"]]], dynamic: []},
         children: []
       }
   """
@@ -87,20 +88,22 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
   @type dynamic_info :: {:dynamic, %{reason: String.t(), expr: String.t(), chain: String.t()}}
   @type class_value :: String.t() | dynamic_info()
   @type variant :: {:toggle, class_value()} | {:either, [class_value() | [class_value()]]}
+  @type child :: t() | Mix.Tasks.HeexClassAnalyzer.Graph.component_edge()
+  @type class_facts :: Mix.Tasks.HeexClassAnalyzer.ClassFacts.t()
 
   @type t :: %__MODULE__{
           tag: String.t() | nil,
           static: [class_value()],
           variants: [variant()],
-          permutations: [[String.t()]],
-          children: [t()],
+          classes: class_facts(),
+          children: [child()],
           repeat: boolean()
         }
 
   defstruct tag: nil,
             static: [],
             variants: [],
-            permutations: [],
+            classes: %{static: [], optional: [], exclusive: [], dynamic: []},
             children: [],
             repeat: false
 end

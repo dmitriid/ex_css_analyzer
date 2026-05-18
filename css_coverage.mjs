@@ -6,7 +6,7 @@
  * PURPOSE
  * -------
  * This script cross-references CSS selectors from the project's `app.css`
- * against the HEEX class analyzer output (JSON files in `analysis/`) to find
+ * against the HEEX class analyzer graph output in `analysis/` to find
  * CSS rules that are never referenced by any template. The goal is to identify
  * dead CSS — rules whose selectors don't match any class combination that could
  * ever appear in the rendered HTML.
@@ -17,9 +17,10 @@
  *
  *        mix heex_class_analyzer
  *
- *    This produces JSON files in the `analysis/` directory, one per Elixir
- *    module. Each file contains a tree representation of the HTML structure
- *    with static and dynamic class information for every element.
+ *    This produces `analysis/heex-class-graph.json`, containing entry refs
+ *    and canonical HEEX trees with component refs as graph edges.
+ *    css_coverage.mjs requires graph version 2 and does not support legacy
+ *    per-module analyzer JSON.
  *
  * 2. Node.js dependencies must be installed at the project root:
  *
@@ -41,10 +42,16 @@
  * CLI FLAGS
  * ---------
  *    --css <path>        Path to the CSS entry file (default: assets/css/app.css)
- *    --analysis <dir>    Directory containing analysis JSON files (default: analysis/)
+ *    --analysis <dir>    Directory containing graph v2 heex-class-graph.json (default: analysis/)
  *    --output <path>     Path for the output JSON report (default: analysis/css-coverage.json)
+ *    --js <path>         JavaScript file or directory to scan for runtime class strings. Can be repeated.
  *    --remove-unmatched     Remove unmatched selectors (and already-invalidated ones) from CSS source
  *    --list-unmatched       List all unmatched selectors (including already-invalidated ones) to stdout
+ *    --list-runtime         List runtime-matched selectors to stdout
+ *    --stats                Print graph/context analysis statistics
+ *    --max-contexts <n>     Maximum rendered contexts to expand before failing (default: 250000)
+ *    --include-node-modules-css
+ *                          Include selectors from CSS imported from node_modules
  *    --help              Show usage information
  *
  *    All paths are resolved relative to the project root (detected by walking
@@ -77,6 +84,7 @@
  * Each selector is decomposed into an ordered list of "segments", where each
  * segment has:
  *   - classes: array of class names required at that position
+ *   - tag: optional element tag required at that position
  *   - combinator: the combinator that connects this segment to the previous
  *     one (null for the first segment, " " for descendant, ">" for child,
  *     "+" for adjacent sibling, "~" for general sibling)
@@ -84,9 +92,9 @@
  *     analyzed node but still enforce their combinator
  *
  * Example decompositions:
- *   `.a.b > .c`  →  [{classes:["a","b"], combinator:null}, {classes:["c"], combinator:">"}]
- *   `.event-page .event-hero__title`  →  [{classes:["event-page"], combinator:null}, {classes:["event-hero__title"], combinator:" "}]
- *   `.x > :not(.a) .b` → [{classes:["x"], combinator:null}, {classes:[], combinator:">", wildcard:true}, {classes:["b"], combinator:" "}]
+ *   `.a.b > .c`  →  [{classes:["a","b"], tag:null, combinator:null}, {classes:["c"], tag:null, combinator:">"}]
+ *   `.event-page .event-hero__title`  →  [{classes:["event-page"], tag:null, combinator:null}, {classes:["event-hero__title"], tag:null, combinator:" "}]
+ *   `.x > a .b` → [{classes:["x"], tag:null, combinator:null}, {classes:[], tag:"a", combinator:">"}, {classes:["b"], tag:null, combinator:" "}]
  *
  * Comma-separated selectors like `.input, .select, .textarea {}` are split
  * into independent selectors, each evaluated separately — if `.input` matches
@@ -96,20 +104,22 @@
  * attribute selectors like `[data-phx-session]`; `:root`) go into the
  * "skipped" category since we can't class-match them.
  *
- * Phase 2: Load Analysis Trees
+ * `:not(.class)` is modeled as a negative class requirement, not as a positive
+ * class that must exist on the element. A selector like
+ * `.btn:hover:not(.disabled)` can therefore match a `.btn` node that is not
+ * always known to have `.disabled`. Unsupported structural pseudo-classes that
+ * require subtree reasoning remain conservative and are skipped.
+ *
+ * Phase 2: Load Analysis Graph
  * ----------------------------
- * All *.json files in the analysis directory are read and parsed. Each file
- * has the structure:
+ * heex-class-graph.json is read from the analysis directory. It must be graph
+ * version 2; legacy per-module analyzer JSON is not supported. It has the
+ * structure:
  *
  *   {
- *     "module": "RsvpWeb.Components.Admin",
- *     "source_file": "lib/rsvp_web/components/admin.ex",
- *     "functions": [
- *       {
- *         "name": "admin_nav/1",
- *         "tree": [ { tag, static, variants, permutations, children }, ... ]
- *       }
- *     ]
+ *     "version": 2,
+ *     "entries": [{ "ref": "fn:...", "module": "...", "name": "render/1" }],
+ *     "trees": { "fn:...": [ { tag, static, variants, classes, children }, ... ] }
  *   }
  *
  * Each node in the tree represents an HTML element and contains:
@@ -117,24 +127,32 @@
  *   - static: array of always-present class names
  *   - variants: array of conditional classes ({type:"toggle", value:...} or
  *     {type:"either", values:[...]})
- *   - permutations: array of arrays — each inner array is one possible
- *     combination of classes the element could have at runtime
+ *   - classes: compact class facts with static, optional, exclusive, and
+ *     dynamic buckets used for selector matching
  *   - repeat: whether the element comes from a HEEx :for and may render
  *     multiple sibling copies of itself
  *   - children: nested child nodes with the same structure
  *
  * DYNAMIC ENTRIES: Objects with {dynamic: true, reason, expr, chain} can
- * appear in permutation arrays wherever a class name would normally be.
+ * appear in class fact dynamic buckets and exclusive branch options.
  * These represent classes computed at runtime (e.g. from an assign like
  * @btn_class) that could be any value. Nodes containing dynamic entries
  * are flagged so that CSS selectors that partially match are categorized
  * as "possibly_dynamic" (with the original reason/expr metadata) rather
  * than "unmatched".
  *
- * An index is built: classToNodes maps each class name to a list of entries
- * containing the module, source file, function name, node reference, ancestor
- * chain, and sibling nodes. A separate allEntries list is kept for selectors
- * whose rightmost segment is classless (for example `.stack > * + *`).
+ * Component refs are spliced in as rendered DOM children, not wrapper nodes.
+ * A rendered context index maps each class name to tiny context records that
+ * reference canonical graph nodes and store parent/previous-sibling links. A
+ * separate allContextIds list is kept for selectors whose rightmost segment is
+ * classless (for example `.stack > * + *`).
+ *
+ * Slot placeholders are materialized against the caller's slot scope. This is
+ * important for nested layouts where component A passes `render_slot(@inner_block)`
+ * into component B: the placeholder must still refer to A's caller, not B's
+ * inner block. Raw HTML placeholders emitted by helpers returning
+ * `Phoenix.HTML.raw/1` are indexed as classless nodes and can satisfy one
+ * immediate child selector segment below their HEEX parent.
  *
  * Phase 3: Match Selectors (Right-to-Left)
  * -----------------------------------------
@@ -144,10 +162,9 @@
  * 1. Start from the RIGHTMOST segment (the "key selector"). If that segment is
  *    classless/wildcard, all analyzed nodes are potential candidates.
  *
- * 2. Find all tree nodes where at least one permutation contains ALL classes
- *    required by that segment. A permutation is a list of class strings;
- *    we check if any single permutation is a superset of the required classes.
- *    If a permutation entry is "<dynamic>", the node COULD match any class.
+ * 2. Find all tree nodes whose class facts can satisfy ALL classes required by
+ *    that segment. Known static, optional, and exclusive classes are checked
+ *    without expanding power sets; exclusive branch conflicts are rejected.
  *    Wildcard segments match any analyzed node.
  *
  * 3. For each candidate node from step 2, recursively walk LEFT through the
@@ -157,28 +174,44 @@
  *    the nearest one:
  *
  *    - Descendant combinator (" "): ANY ancestor in the chain must have a
- *      permutation satisfying the segment's classes.
+ *      class facts satisfying the segment's classes.
  *    - Child combinator (">"): the IMMEDIATE parent must satisfy the segment.
  *    - Adjacent sibling combinator ("+"): a sibling node (another child of
  *      the same parent), or another rendered copy of the same repeatable
  *      node, must satisfy the segment.
  *    - General sibling combinator ("~"): same as "+", any sibling works.
  *
- *    "Satisfies a segment" means: does any permutation of that node contain
- *    ALL classes in the segment? Wildcard segments satisfy any analyzed node.
+ *    "Satisfies a segment" means: can that node's class facts contain ALL
+ *    classes in the segment? Wildcard segments satisfy any analyzed node.
  *
  * 4. Results are categorized:
  *    - matched: all segments satisfied statically, with full provenance.
+ *    - runtime-matched: HEEX graph does not prove the selector, but runtime
+ *      class evidence explains the missing class atoms without inventing DOM
+ *      structure.
  *    - possibly_dynamic: couldn't match statically, but a candidate path
  *      involves nodes with dynamic ("<dynamic>") entries.
  *    - unmatched: no match found and no dynamic entries involved.
  *    - skipped: selectors with no class components.
  *
+ * Runtime evidence comes from:
+ *   - JavaScript string literals in configured `--js` paths, defaulting to
+ *     project asset JS locations.
+ *   - CSS imported from `node_modules` when package CSS is imported. Those
+ *     classes explain browser/runtime library DOM such as Plyr markup.
+ *   - Built-in Phoenix runtime classes that Phoenix itself may add, such as
+ *     `phx-drop-target-active`.
+ *
+ * Runtime evidence can satisfy missing class atoms for selectors whose
+ * remaining structure is already known from HEEX. It cannot create parent,
+ * child, or sibling relationships that the graph does not contain.
+ *
  * OUTPUT FORMAT
  * -------------
  * The script writes JSON to analysis/css-coverage.json (configurable) with
- * four arrays (matched, possibly_dynamic, unmatched, skipped) and a summary
- * object with counts. It also prints a one-line summary to stdout.
+ * arrays for matched, runtime_matched, possibly_dynamic, unmatched, and skipped
+ * selectors plus a summary object with counts. It also prints a one-line
+ * summary to stdout.
  *
  * Each matched entry includes:
  *   - selector: the original CSS selector text
@@ -196,10 +229,16 @@
  * path, the selector is classified as "possibly_dynamic" with metadata about
  * which part was unresolved.
  *
+ * MUTATION FLAGS
+ * --------------
+ * `--remove-unmatched`, `--invalidate-unmatched`, and `--restore-unmatched`
+ * operate only on actual unmatched selectors and unused keyframes. They do not
+ * touch runtime-matched selectors.
+ *
  * ============================================================================
  */
 
-import { readFileSync, writeFileSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { resolve, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import postcss from "postcss";
@@ -235,20 +274,27 @@ function parseArgs() {
     restoreUnmatched: false,
     removeUnmatched: false,
     listUnmatched: false,
+    listRuntime: false,
+    stats: false,
+    maxContexts: 250000,
+    includeNodeModulesCss: false,
+    jsPaths: [],
   };
 
   const HELP = `Usage: node css_coverage.mjs [options]
   --css <path>              CSS file (default: assets/css/app.css)
-  --analysis <dir>          Analysis JSON dir (default: analysis/)
+  --analysis <dir>          Directory containing graph v2 heex-class-graph.json (default: analysis/)
   --output <path>           Output file (default: analysis/css-coverage.json)
+  --js <path>               JavaScript file or directory to scan for runtime class strings. Can be repeated.
   --invalidate-unmatched    Prepend ${UNMATCHED_MARKER} to unmatched selectors in the CSS source
   --restore-unmatched       Remove ${UNMATCHED_MARKER} markers from all selectors in the CSS source
   --remove-unmatched           Remove unmatched selectors (and already-invalidated ones) from CSS source
   --list-unmatched             List all unmatched selectors (including already-invalidated ones) to stdout
+  --list-runtime               List all runtime-matched selectors to stdout
+  --stats                      Print graph/context analysis statistics
+  --max-contexts <n>           Maximum rendered contexts to expand before failing (default: 250000)
+  --include-node-modules-css   Include selectors from CSS imported from node_modules
   --help                    Show this message`;
-
-  const FLAGS_WITH_VALUE = new Set(["--css", "--analysis", "--output"]);
-  const FLAGS_BOOLEAN = new Set(["--invalidate-unmatched", "--restore-unmatched", "--help"]);
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -262,6 +308,8 @@ function parseArgs() {
       opts.analysis = args[++i];
     } else if (arg === "--output") {
       opts.output = args[++i];
+    } else if (arg === "--js") {
+      opts.jsPaths.push(args[++i]);
     } else if (arg === "--invalidate-unmatched") {
       opts.invalidateUnmatched = true;
     } else if (arg === "--restore-unmatched") {
@@ -270,6 +318,14 @@ function parseArgs() {
       opts.removeUnmatched = true;
     } else if (arg === "--list-unmatched") {
       opts.listUnmatched = true;
+    } else if (arg === "--list-runtime") {
+      opts.listRuntime = true;
+    } else if (arg === "--stats") {
+      opts.stats = true;
+    } else if (arg === "--max-contexts") {
+      opts.maxContexts = parsePositiveIntegerFlag(arg, args[++i]);
+    } else if (arg === "--include-node-modules-css") {
+      opts.includeNodeModulesCss = true;
     } else {
       console.error(`Unknown option: ${arg}\n`);
       console.error(HELP);
@@ -277,6 +333,27 @@ function parseArgs() {
     }
   }
   return opts;
+}
+
+function parsePositiveIntegerFlag(flag, value) {
+  if (value === undefined || value.startsWith("--")) {
+    console.error(`${flag} requires a positive decimal integer value`);
+    process.exit(1);
+  }
+
+  if (!/^[0-9]+$/.test(value)) {
+    console.error(`${flag} must be a positive decimal integer`);
+    process.exit(1);
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    console.error(`${flag} must be a positive decimal integer`);
+    process.exit(1);
+  }
+
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +369,7 @@ const SKIP_AT_RULES = new Set([
 
 const UNMATCHED_PREFIX = "____unmatched___";
 const UNMATCHED_MARKER = "." + UNMATCHED_PREFIX;
+const PHOENIX_RUNTIME_CLASSES = ["phx-drop-target-active"];
 
 /**
  * Parse a CSS file and return an array of parsed selector descriptors.
@@ -301,9 +379,10 @@ const UNMATCHED_MARKER = "." + UNMATCHED_PREFIX;
  *
  * Comma-separated selectors produce separate descriptors.
  */
-async function parseCss(cssPath, projectRoot) {
+async function parseCss(cssPath, projectRoot, opts = {}) {
   const cssContent = readFileSync(cssPath, "utf-8");
   const relCssPath = relative(projectRoot, cssPath);
+  const nodeModulesCssEvidence = opts.nodeModulesCssEvidence || new Map();
 
   // Pre-filter: strip lines that postcss-import can't handle and that
   // aren't standard @import directives pointing to local files.
@@ -312,8 +391,13 @@ async function parseCss(cssPath, projectRoot) {
     .split("\n")
     .map((line) => {
       const trimmed = line.trim();
-      // Skip @import "tailwindcss" or any @import that doesn't look like a file path
-      if (/^@import\s+["'](?!\.\/|\.\.\/|\/)/.test(trimmed)) {
+      // Skip imports that postcss-import cannot resolve as local files.
+      // Package-style imports are left intact so node_modules CSS can be
+      // harvested as runtime class evidence.
+      if (
+        /^@import\s+["']tailwindcss["']/.test(trimmed) ||
+        /^@import\s+(url\()?["']?https?:\/\//.test(trimmed)
+      ) {
         return "/* [css-coverage: skipped] " + trimmed + " */";
       }
       // Skip Tailwind-specific at-rules that postcss can't parse
@@ -328,6 +412,17 @@ async function parseCss(cssPath, projectRoot) {
     postcssImport({
       load(filename) {
         if (!filename || !existsSync(filename)) return "";
+        if (!opts.includeNodeModulesCss && isNodeModulesPath(filename)) {
+          collectNodeModulesCssRuntimeEvidence(
+            readFileSync(filename, "utf-8"),
+            filename,
+            projectRoot,
+            nodeModulesCssEvidence
+          );
+
+          return "";
+        }
+
         return readFileSync(filename, "utf-8");
       },
     }),
@@ -384,6 +479,17 @@ async function parseCss(cssPath, projectRoot) {
           continue;
         }
 
+        if (selectorHasUnsupportedRuntimePseudo(sel)) {
+          selectors.push({
+            selectorText,
+            file: sourceFile,
+            line,
+            segments: null,
+            skipReason: "unsupported structural pseudo-class",
+          });
+          continue;
+        }
+
         const segments = extractSegments(sel);
 
         if (segments === null) {
@@ -416,6 +522,302 @@ async function parseCss(cssPath, projectRoot) {
   });
 
   return selectors;
+}
+
+function isNodeModulesPath(filename) {
+  return /(^|[/\\])node_modules([/\\]|$)/.test(filename);
+}
+
+function collectNodeModulesCssRuntimeEvidence(cssContent, cssPath, projectRoot, evidence) {
+  let root;
+
+  try {
+    root = postcss.parse(cssContent, { from: cssPath });
+  } catch {
+    return;
+  }
+
+  root.walkRules((rule) => {
+    const line = rule.source && rule.source.start ? rule.source.start.line : null;
+
+    try {
+      const parsed = selectorParser().astSync(rule.selector);
+
+      parsed.walkClasses((classNode) => {
+        addRuntimeEvidence(evidence, classNode.value, {
+          file: relative(projectRoot, cssPath),
+          line,
+          literal: rule.selector,
+          source: "node_modules_css",
+        });
+      });
+    } catch {
+      // Ignore vendor selectors that postcss-selector-parser cannot parse.
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Runtime JavaScript Class Evidence
+// ---------------------------------------------------------------------------
+
+const CLASS_TOKEN_RE = /[A-Za-z_][A-Za-z0-9_-]*(?:\[[^\]\s]+\])?/g;
+
+function discoverJavaScriptFiles(paths) {
+  const files = new Set();
+
+  function visit(path) {
+    if (!path || !existsSync(path) || isNodeModulesPath(path)) return;
+
+    const stat = statSync(path);
+
+    if (stat.isDirectory()) {
+      for (const entry of readdirSync(path)) {
+        visit(join(path, entry));
+      }
+    } else if (stat.isFile() && /\.(m?js)$/.test(path)) {
+      files.add(path);
+    }
+  }
+
+  for (const path of paths) visit(path);
+
+  return [...files].sort();
+}
+
+function extractJavaScriptStringLiterals(sourceText) {
+  const literals = [];
+  let i = 0;
+  let line = 1;
+
+  while (i < sourceText.length) {
+    const ch = sourceText[i];
+
+    if (ch === "\n") {
+      line++;
+      i++;
+      continue;
+    }
+
+    if (ch === "/" && sourceText[i + 1] === "/") {
+      i += 2;
+      while (i < sourceText.length && sourceText[i] !== "\n") i++;
+      continue;
+    }
+
+    if (ch === "/" && sourceText[i + 1] === "*") {
+      i += 2;
+      while (i < sourceText.length) {
+        if (sourceText[i] === "\n") line++;
+        if (sourceText[i] === "*" && sourceText[i + 1] === "/") {
+          i += 2;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      const startLine = line;
+      const { value, nextIndex, line: nextLine } = readQuotedLiteral(sourceText, i, ch, line);
+      literals.push({ literal: value, line: startLine });
+      i = nextIndex;
+      line = nextLine;
+      continue;
+    }
+
+    if (ch === "`") {
+      const { chunks, nextIndex, line: nextLine } = readTemplateLiteral(sourceText, i, line);
+      literals.push(...chunks);
+      i = nextIndex;
+      line = nextLine;
+      continue;
+    }
+
+    i++;
+  }
+
+  return literals.filter(({ literal }) => literal.length > 0);
+}
+
+function readQuotedLiteral(sourceText, startIndex, quote, startLine) {
+  let value = "";
+  let i = startIndex + 1;
+  let line = startLine;
+
+  while (i < sourceText.length) {
+    const ch = sourceText[i];
+
+    if (ch === "\n") line++;
+
+    if (ch === "\\") {
+      if (i + 1 < sourceText.length) {
+        value += sourceText[i + 1];
+        if (sourceText[i + 1] === "\n") line++;
+        i += 2;
+        continue;
+      }
+    }
+
+    if (ch === quote) {
+      return { value, nextIndex: i + 1, line };
+    }
+
+    value += ch;
+    i++;
+  }
+
+  return { value, nextIndex: i, line };
+}
+
+function readTemplateLiteral(sourceText, startIndex, startLine) {
+  const chunks = [];
+  let current = "";
+  let currentLine = startLine;
+  let i = startIndex + 1;
+  let line = startLine;
+
+  while (i < sourceText.length) {
+    const ch = sourceText[i];
+
+    if (ch === "\n") line++;
+
+    if (ch === "\\") {
+      if (i + 1 < sourceText.length) {
+        current += sourceText[i + 1];
+        if (sourceText[i + 1] === "\n") line++;
+        i += 2;
+        continue;
+      }
+    }
+
+    if (ch === "`") {
+      if (current.length > 0) chunks.push({ literal: current, line: currentLine });
+      return { chunks, nextIndex: i + 1, line };
+    }
+
+    if (ch === "$" && sourceText[i + 1] === "{") {
+      if (current.length > 0) chunks.push({ literal: current, line: currentLine });
+      current = "";
+      i += 2;
+      const skipped = skipTemplateExpression(sourceText, i, line);
+      i = skipped.nextIndex;
+      line = skipped.line;
+      currentLine = line;
+      continue;
+    }
+
+    if (current.length === 0) currentLine = line;
+    current += ch;
+    i++;
+  }
+
+  if (current.length > 0) chunks.push({ literal: current, line: currentLine });
+  return { chunks, nextIndex: i, line };
+}
+
+function skipTemplateExpression(sourceText, startIndex, startLine) {
+  let depth = 1;
+  let i = startIndex;
+  let line = startLine;
+
+  while (i < sourceText.length && depth > 0) {
+    const ch = sourceText[i];
+
+    if (ch === "\n") line++;
+
+    if (ch === '"' || ch === "'") {
+      const quoted = readQuotedLiteral(sourceText, i, ch, line);
+      i = quoted.nextIndex;
+      line = quoted.line;
+      continue;
+    }
+
+    if (ch === "`") {
+      const template = readTemplateLiteral(sourceText, i, line);
+      i = template.nextIndex;
+      line = template.line;
+      continue;
+    }
+
+    if (ch === "{") depth++;
+    if (ch === "}") depth--;
+    i++;
+  }
+
+  return { nextIndex: i, line };
+}
+
+function buildRuntimeClassEvidence(files, projectRoot) {
+  const evidence = new Map();
+
+  for (const file of files) {
+    const sourceText = readFileSync(file, "utf-8");
+
+    for (const { literal, line } of extractJavaScriptStringLiterals(sourceText)) {
+      for (const token of classTokensFromLiteral(literal)) {
+        addRuntimeEvidence(evidence, token, {
+          file: relative(projectRoot, file),
+          line,
+          literal,
+        });
+      }
+    }
+  }
+
+  return evidence;
+}
+
+function buildPhoenixRuntimeClassEvidence() {
+  const evidence = new Map();
+
+  for (const token of PHOENIX_RUNTIME_CLASSES) {
+    addRuntimeEvidence(evidence, token, {
+      file: "<phoenix-runtime>",
+      line: null,
+      literal: token,
+    });
+  }
+
+  return evidence;
+}
+
+function addRuntimeEvidence(evidence, token, entry) {
+  if (!token) return;
+  if (!evidence.has(token)) evidence.set(token, []);
+  evidence.get(token).push(entry);
+}
+
+function mergeRuntimeEvidence(...evidenceMaps) {
+  const merged = new Map();
+
+  for (const evidence of evidenceMaps) {
+    for (const [token, entries] of evidence) {
+      for (const entry of entries) {
+        addRuntimeEvidence(merged, token, entry);
+      }
+    }
+  }
+
+  return merged;
+}
+
+function classTokensFromLiteral(literal) {
+  const tokens = new Set();
+
+  for (const match of literal.matchAll(CLASS_TOKEN_RE)) {
+    const token = match[0].replace(/^\./, "");
+    if (token && !token.endsWith("-")) tokens.add(token);
+  }
+
+  return tokens;
+}
+
+function serializeRuntimeEvidence(evidence) {
+  return Object.fromEntries(
+    [...evidence.entries()].sort(([a], [b]) => a.localeCompare(b))
+  );
 }
 
 /**
@@ -470,35 +872,63 @@ function stringifySelector(selectorNode) {
   return String(selectorNode).trim();
 }
 
+function selectorHasUnsupportedRuntimePseudo(selectorNode) {
+  let unsupported = false;
+
+  selectorNode.walkPseudos((pseudoNode) => {
+    if (pseudoNode.value === ":has" && pseudoContainsClass(pseudoNode)) {
+      unsupported = true;
+    }
+  });
+
+  return unsupported;
+}
+
+function pseudoContainsClass(pseudoNode) {
+  let containsClass = false;
+  pseudoNode.walkClasses(() => {
+    containsClass = true;
+  });
+  return containsClass;
+}
+
 /**
  * Extract segments from a postcss-selector-parser selector node.
  *
- * Returns an array of {classes:string[], combinator:string|null} or null
+ * Returns an array of {classes:string[], notClasses:string[], tag:string|null, combinator:string|null} or null
  * if the selector contains no class selectors at all.
  */
 function extractSegments(selectorNode) {
   const segments = [];
   let currentClasses = [];
+  let currentNotClasses = [];
+  let currentTag = null;
   let currentCombinator = null;
   let currentHasClasslessStructure = false;
   let hasAnyClass = false;
 
   function flushCurrentSegment() {
-    if (currentClasses.length > 0) {
+    if (currentClasses.length > 0 || currentNotClasses.length > 0 || currentTag) {
       segments.push({
         classes: currentClasses,
+        notClasses: currentNotClasses,
+        tag: currentTag,
         combinator: currentCombinator,
         wildcard: false,
       });
     } else if (currentHasClasslessStructure && currentCombinator !== null) {
       segments.push({
         classes: [],
+        notClasses: [],
+        tag: null,
         combinator: currentCombinator,
         wildcard: true,
       });
     }
 
     currentClasses = [];
+    currentNotClasses = [];
+    currentTag = null;
     currentHasClasslessStructure = false;
   }
 
@@ -517,6 +947,10 @@ function extractSegments(selectorNode) {
       }
 
       case "tag":
+        currentTag = node.value;
+        currentHasClasslessStructure = true;
+        break;
+
       case "id":
       case "attribute":
       case "universal":
@@ -526,9 +960,17 @@ function extractSegments(selectorNode) {
         break;
 
       case "pseudo":
-        // Skip pseudo-classes and pseudo-elements entirely.
-        // Don't descend into :not(), :where(), etc.
-        currentHasClasslessStructure = true;
+        if (node.value === ":not") {
+          const notClasses = classNamesInsidePseudo(node);
+          if (notClasses.length > 0) {
+            currentNotClasses.push(...notClasses);
+            hasAnyClass = true;
+          }
+        } else {
+          // Skip pseudo-classes and pseudo-elements entirely.
+          // Don't descend into :where(), etc.
+          currentHasClasslessStructure = true;
+        }
         break;
 
       case "selector":
@@ -547,11 +989,19 @@ function extractSegments(selectorNode) {
 
   // Keep wildcard segments between classed segments because they preserve
   // structural combinators like `.x > :not(...) .y`.
-  return segments.filter((s) => s.wildcard || s.classes.length > 0);
+  return segments.filter(
+    (s) => s.wildcard || s.classes.length > 0 || s.notClasses.length > 0 || s.tag
+  );
+}
+
+function classNamesInsidePseudo(pseudoNode) {
+  const classes = [];
+  pseudoNode.walkClasses((classNode) => classes.push(classNode.value));
+  return classes;
 }
 
 // ---------------------------------------------------------------------------
-// PHASE 2: Load Analysis Trees and Build Index
+// PHASE 2: Load Analysis Graph and Build Index
 // ---------------------------------------------------------------------------
 
 /**
@@ -562,141 +1012,527 @@ function isDynamic(value) {
   return typeof value === "object" && value !== null && value.dynamic === true;
 }
 
+function classFactsForNode(node) {
+  return node.classes && typeof node.classes === "object" ? node.classes : null;
+}
+
 /**
- * Check whether a node has any dynamic entries in its permutations.
+ * Check whether a node has any dynamic class facts.
  */
 function nodeHasDynamic(node) {
-  if (!node.permutations) return false;
-  for (const perm of node.permutations) {
-    if (perm.some(isDynamic)) return true;
+  const facts = classFactsForNode(node);
+  if (facts) {
+    if ((facts.dynamic || []).length > 0) return true;
+
+    for (const group of facts.exclusive || []) {
+      for (const option of group || []) {
+        if ((option || []).some(isDynamic)) return true;
+      }
+    }
+
+    return false;
   }
+
   return false;
 }
 
 /**
- * Extract dynamic entry metadata from a node's permutations.
+ * Extract dynamic entry metadata from a node's class facts.
  * Returns the first dynamic object found (with reason, expr, chain fields),
  * or a generic fallback.
  */
 function extractDynamicInfo(node) {
-  if (!node.permutations) return { reason: "dynamic", expr: "<unknown>", chain: null };
-  for (const perm of node.permutations) {
-    for (const entry of perm) {
-      if (isDynamic(entry)) {
-        return { reason: entry.reason, expr: entry.expr, chain: entry.chain };
+  const facts = classFactsForNode(node);
+  if (facts) {
+    const direct = (facts.dynamic || []).find(isDynamic);
+    if (direct) return { reason: direct.reason, expr: direct.expr, chain: direct.chain };
+
+    for (const group of facts.exclusive || []) {
+      for (const option of group || []) {
+        const dynamic = (option || []).find(isDynamic);
+        if (dynamic) return { reason: dynamic.reason, expr: dynamic.expr, chain: dynamic.chain };
       }
     }
+
+    return { reason: "dynamic", expr: "<unknown>", chain: null };
   }
+
   return { reason: "dynamic", expr: "<unknown>", chain: null };
 }
 
 /**
  * Build a label for a node: "tag.class1.class2"
- * Uses the first permutation's non-dynamic classes for the label.
+ * Uses known non-dynamic classes from class facts for the label.
  */
 function nodeLabel(node) {
+  if (isRawHtmlNode(node)) return "raw-html";
+
   const tag = node.tag || "?";
-  if (!node.permutations || node.permutations.length === 0) return tag;
-  const longestPerm = node.permutations.reduce((a, b) => a.length >= b.length ? a : b, []);
-  const classes = longestPerm.filter((c) => !isDynamic(c));
-  if (classes.length === 0) return tag;
-  return `${tag}.${classes.join(".")}`;
+  const facts = classFactsForNode(node);
+  if (facts) {
+    const classes = [
+      ...(facts.static || []),
+      ...(facts.optional || []),
+      ...(facts.exclusive || []).flatMap((group) =>
+        (group || []).flatMap((option) => (option || []).filter((c) => !isDynamic(c)))
+      ),
+    ];
+    const uniqueClasses = [...new Set(classes)];
+    if (uniqueClasses.length === 0) return tag;
+    return `${tag}.${uniqueClasses.join(".")}`;
+  }
+
+  return tag;
 }
 
 /**
- * Load all analysis JSON files from a directory and build the classToNodes index.
+ * Load graph version 2 heex-class-graph.json from a directory and build the
+ * rendered context index. Legacy per-module analyzer JSON is not supported.
  *
- * classToNodes: Map<className, Array<{module, sourceFile, functionName, node, ancestors, siblings, hasDynamic}>>
- *
- * ancestors: array of parent node references from root down (not including the node itself)
- * siblings: array of sibling node references (other children of the same parent)
+ * Component refs are expanded as rendered children. They are not wrapper nodes,
+ * so child and descendant selectors see the same shape Phoenix renders.
  */
-function loadAnalysisTrees(analysisDir) {
-  const classToNodes = new Map();
-  const allEntries = [];
-  const files = readdirSync(analysisDir).filter(
-    (f) => f.endsWith(".json") && f !== "css-coverage.json"
-  );
+function loadGraphAnalysis(analysisDir, opts = {}) {
+  const graphPath = join(analysisDir, "heex-class-graph.json");
 
-  for (const file of files) {
-    const filePath = join(analysisDir, file);
-    let data;
-    try {
-      data = JSON.parse(readFileSync(filePath, "utf-8"));
-    } catch (err) {
-      console.warn(`WARNING: Skipping malformed JSON file: ${file} (${err.message})`);
-      continue;
+  if (!existsSync(graphPath)) {
+    throw new Error(
+      `Missing ${graphPath}. Run mix heex_class_analyzer to generate heex-class-graph.json.`
+    );
+  }
+
+  const graph = JSON.parse(readFileSync(graphPath, "utf-8"));
+
+  if (graph.version !== 2) {
+    throw new Error("Expected HEEX class graph version 2");
+  }
+
+  const index = buildGraphIndex(graph, opts);
+
+  index.cycles = deduplicateCycleDiagnostics([
+    ...normalizeGraphCycles(graph.cycles || []),
+    ...index.cycles,
+  ]);
+  index.unresolvedRefs = deduplicateDiagnostics([
+    ...(graph.unresolved || []),
+    ...index.unresolvedRefs,
+  ]);
+  index.stats.cycles = index.cycles.length;
+  index.stats.unresolvedRefs = index.unresolvedRefs.length;
+
+  return index;
+}
+
+/**
+ * Build a rendered context index without cloning canonical graph nodes.
+ */
+function buildGraphIndex(graph, opts = {}) {
+  const index = {
+    graph,
+    contexts: [],
+    classToContexts: new Map(),
+    allContextIds: [],
+    ambientAncestorIds: [],
+    rawHtmlContextIds: [],
+    cycles: [],
+    unresolvedRefs: [],
+    stats: {
+      entries: (graph.entries || []).length,
+      treeRefs: Object.keys(graph.trees || {}).length,
+      canonicalNodes: countCanonicalNodes(graph),
+      contexts: 0,
+      classIndexKeys: 0,
+      selectorCount: 0,
+      maxClassesPerNode: 0,
+      maxCallStackDepth: 0,
+      cycles: 0,
+      unresolvedRefs: 0,
+    },
+    maxContexts: opts.maxContexts || 250000,
+  };
+
+  for (const entry of graph.entries || []) {
+    expandRefIntoContexts(index, entry.ref, {
+      entry,
+      definitionRef: entry.ref,
+      parentId: null,
+      previousSiblingId: null,
+      callStack: [],
+      callsite: null,
+    });
+  }
+
+  index.stats.contexts = index.contexts.length;
+  index.stats.classIndexKeys = index.classToContexts.size;
+  index.stats.cycles = index.cycles.length;
+  index.stats.unresolvedRefs = index.unresolvedRefs.length;
+
+  return index;
+}
+
+function isComponentRefNode(node) {
+  return node && Array.isArray(node.component_refs);
+}
+
+function isSlotPlaceholderNode(node) {
+  return node && typeof node.slot_name === "string";
+}
+
+function isRawHtmlNode(node) {
+  return node && node.raw_html === true;
+}
+
+function countCanonicalNodes(graph) {
+  let count = 0;
+
+  function visit(nodes) {
+    for (const node of nodes || []) {
+      if (isComponentRefNode(node)) continue;
+
+      count++;
+      visit(node.children || []);
+    }
+  }
+
+  for (const tree of Object.values(graph.trees || {})) {
+    visit(tree);
+  }
+
+  return count;
+}
+
+function expandRefIntoContexts(index, ref, context) {
+  if (context.callStack.includes(ref)) {
+    index.cycles.push(buildPathDiagnostic([...context.callStack, ref], context.callsite));
+    return [];
+  }
+
+  const tree = index.graph.trees && index.graph.trees[ref];
+  if (!Array.isArray(tree)) {
+    index.unresolvedRefs.push(
+      buildRefDiagnostic(ref, [...context.callStack, ref], context.callsite)
+    );
+    return [];
+  }
+
+  return expandNodeListIntoContexts(index, tree, {
+    ...context,
+    definitionRef: ref,
+    callStack: [...context.callStack, ref],
+  });
+}
+
+function expandNodeListIntoContexts(index, nodes, context) {
+  const renderedIds = [];
+  let previousSiblingId = context.previousSiblingId ?? null;
+
+  for (const node of nodes || []) {
+    let currentIds;
+
+    if (isSlotPlaceholderNode(node)) {
+      currentIds = expandNodeListIntoContexts(
+        index,
+        (context.slotChildrenByName && context.slotChildrenByName[node.slot_name]) || [],
+        {
+          ...context,
+          previousSiblingId,
+        }
+      );
+
+      if (currentIds.length > 0) {
+        previousSiblingId = currentIds[currentIds.length - 1];
+      }
+    } else if (isComponentRefNode(node)) {
+      currentIds = [];
+      const rawSlotChildrenByName =
+        node.slot_children_by_name || legacySlotChildrenByName(node.slot_children || []);
+      const slotChildrenByName = bindSlotChildrenToCallerScope(
+        rawSlotChildrenByName,
+        context.slotChildrenByName || {}
+      );
+      const hasNamedSlots = Boolean(node.slot_children_by_name);
+
+      for (const ref of node.component_refs || []) {
+        const refIds = expandRefIntoContexts(index, ref, {
+          ...context,
+          previousSiblingId,
+          slotChildrenByName,
+          callsite: node.callsite || null,
+        });
+
+        currentIds.push(...refIds);
+
+        if (!hasNamedSlots) for (const rootId of refIds) {
+          expandSlotChildrenIntoContexts(index, node.slot_children || [], {
+            ...context,
+            parentId: rootId,
+            callsite: node.callsite || null,
+          });
+        }
+
+        if (refIds.length > 0) {
+          previousSiblingId = refIds[refIds.length - 1];
+        }
+      }
+    } else {
+      const contextId = addContext(index, node, {
+        ...context,
+        previousSiblingId,
+      });
+
+      currentIds = [contextId];
+      previousSiblingId = contextId;
     }
 
-    const moduleName = data.module || file.replace(/\.json$/, "");
-    const sourceFile = data.source_file || "";
+    renderedIds.push(...currentIds);
+  }
 
-    if (!data.functions || !Array.isArray(data.functions)) continue;
+  return renderedIds;
+}
 
-    for (const fn of data.functions) {
-      if (!fn.tree || !Array.isArray(fn.tree)) continue;
+function legacySlotChildrenByName(slotChildren) {
+  return slotChildren.length > 0 ? { inner_block: slotChildren } : {};
+}
 
-      // Walk the tree, tracking ancestors
-      walkTree(fn.tree, [], null, (node, ancestors, parentNode) => {
-        const hasDynamic = nodeHasDynamic(node);
+function bindSlotChildrenToCallerScope(slotChildrenByName, callerSlotChildrenByName) {
+  const bound = {};
 
-        // Collect all class names from this node
-        const allClasses = collectNodeClasses(node);
+  for (const [slotName, children] of Object.entries(slotChildrenByName || {})) {
+    bound[slotName] = bindSlotNodeListToCallerScope(children, callerSlotChildrenByName, new Set());
+  }
 
-        // Compute siblings: other children of the same parent
-        let siblings = [];
-        if (parentNode && parentNode.children) {
-          siblings = parentNode.children.filter((c) => c !== node);
-        }
+  return bound;
+}
 
-        const entry = {
-          module: moduleName,
-          sourceFile,
-          functionName: fn.name,
-          node,
-          ancestors: [...ancestors],
-          siblings,
-          hasDynamic,
-        };
+function bindSlotNodeListToCallerScope(nodes, callerSlotChildrenByName, seenSlots) {
+  const bound = [];
 
-        allEntries.push(entry);
+  for (const node of nodes || []) {
+    if (isSlotPlaceholderNode(node)) {
+      if (seenSlots.has(node.slot_name)) continue;
 
-        for (const cls of allClasses) {
-          if (isDynamic(cls)) continue;
-          if (!classToNodes.has(cls)) classToNodes.set(cls, []);
-          classToNodes.get(cls).push(entry);
-        }
+      const nextSeenSlots = new Set(seenSlots);
+      nextSeenSlots.add(node.slot_name);
+
+      bound.push(
+        ...bindSlotNodeListToCallerScope(
+          callerSlotChildrenByName[node.slot_name] || [],
+          callerSlotChildrenByName,
+          nextSeenSlots
+        )
+      );
+    } else if (isComponentRefNode(node)) {
+      bound.push(bindComponentSlotNodeToCallerScope(node, callerSlotChildrenByName, seenSlots));
+    } else {
+      bound.push({
+        ...node,
+        children: bindSlotNodeListToCallerScope(
+          node.children || [],
+          callerSlotChildrenByName,
+          seenSlots
+        ),
       });
     }
   }
 
-  classToNodes.allEntries = allEntries;
-  return classToNodes;
+  return bound;
 }
 
-/**
- * Recursively walk a node tree, calling callback(node, ancestors, parentNode) for each node.
- */
-function walkTree(nodes, ancestors, parentNode, callback) {
-  for (const node of nodes) {
-    callback(node, ancestors, parentNode);
-    if (node.children && node.children.length > 0) {
-      walkTree(node.children, [...ancestors, node], node, callback);
+function bindComponentSlotNodeToCallerScope(node, callerSlotChildrenByName, seenSlots) {
+  const bound = { ...node };
+
+  if (node.slot_children_by_name) {
+    bound.slot_children_by_name = {};
+
+    for (const [slotName, children] of Object.entries(node.slot_children_by_name)) {
+      bound.slot_children_by_name[slotName] = bindSlotNodeListToCallerScope(
+        children,
+        callerSlotChildrenByName,
+        seenSlots
+      );
     }
+  }
+
+  if (node.slot_children) {
+    bound.slot_children = bindSlotNodeListToCallerScope(
+      node.slot_children,
+      callerSlotChildrenByName,
+      seenSlots
+    );
+  }
+
+  return bound;
+}
+
+function expandChildrenIntoContexts(index, children, context) {
+  return expandNodeListIntoContexts(index, children || [], {
+    ...context,
+    parentId: context.id,
+    previousSiblingId: null,
+  });
+}
+
+function expandSlotChildrenIntoContexts(index, children, context) {
+  return expandNodeListIntoContexts(index, children || [], {
+    ...context,
+    previousSiblingId: null,
+  });
+}
+
+function addContext(index, node, context) {
+  if (index.contexts.length >= index.maxContexts) {
+    throw new Error(
+      `Context limit exceeded (${index.maxContexts}) while expanding ${context.definitionRef} from ${context.entry.ref}`
+    );
+  }
+
+  const id = index.contexts.length;
+  const renderedContext = {
+    id,
+    entryRef: context.entry.ref,
+    entryModule: context.entry.module || "",
+    entrySourceFile: context.entry.source_file || "",
+    entryName: context.entry.name || context.entry.ref,
+    definitionRef: context.definitionRef,
+    node,
+    parentId: context.parentId,
+    previousSiblingId: context.previousSiblingId ?? null,
+    callStack: [...(context.callStack || [])],
+    slotChildrenByName: context.slotChildrenByName || {},
+  };
+
+  index.contexts.push(renderedContext);
+  index.allContextIds.push(id);
+
+  if (node.tag === "body") {
+    index.ambientAncestorIds.push(id);
+  }
+
+  if (isRawHtmlNode(node)) {
+    index.rawHtmlContextIds.push(id);
+  }
+
+  const allClasses = [...collectNodeClasses(node)].filter((cls) => !isDynamic(cls));
+  index.stats.maxClassesPerNode = Math.max(index.stats.maxClassesPerNode, allClasses.length);
+  index.stats.maxCallStackDepth = Math.max(
+    index.stats.maxCallStackDepth,
+    renderedContext.callStack.length
+  );
+
+  for (const cls of allClasses) {
+    if (!index.classToContexts.has(cls)) index.classToContexts.set(cls, []);
+    index.classToContexts.get(cls).push(renderedContext);
+  }
+
+  expandChildrenIntoContexts(index, node.children || [], {
+    ...renderedContext,
+    entry: context.entry,
+  });
+
+  return id;
+}
+
+function normalizeGraphCycles(cycles) {
+  return cycles
+    .map((cycle) => {
+      if (Array.isArray(cycle)) return buildPathDiagnostic(cycle);
+      if (cycle && Array.isArray(cycle.path)) return cycle;
+      return null;
+    })
+    .filter(Boolean);
+}
+
+function buildPathDiagnostic(path, callsite = null) {
+  const diagnostic = { path };
+  if (callsite) diagnostic.callsite = callsite;
+  return diagnostic;
+}
+
+function buildRefDiagnostic(ref, path, callsite = null) {
+  const diagnostic = { ref, path };
+  if (callsite) diagnostic.callsite = callsite;
+  return diagnostic;
+}
+
+function deduplicateDiagnostics(diagnostics) {
+  const seen = new Set();
+  const deduped = [];
+
+  for (const diagnostic of diagnostics) {
+    const key = JSON.stringify(diagnostic);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(diagnostic);
+  }
+
+  return deduped;
+}
+
+function deduplicateCycleDiagnostics(diagnostics) {
+  const byPath = new Map();
+  const deduped = [];
+
+  for (const diagnostic of diagnostics) {
+    const key = JSON.stringify(diagnostic.path || []);
+    const existing = byPath.get(key);
+
+    if (existing) {
+      mergeDiagnosticMetadata(existing, diagnostic);
+      continue;
+    }
+
+    byPath.set(key, diagnostic);
+    deduped.push(diagnostic);
+  }
+
+  return deduped;
+}
+
+function mergeDiagnosticMetadata(target, source) {
+  for (const [key, value] of Object.entries(source)) {
+    if (target[key] === undefined) target[key] = value;
   }
 }
 
 /**
- * Collect all unique class names from a node's permutations.
+ * Collect all unique class names from a node's class facts.
  */
 function collectNodeClasses(node) {
   const classes = new Set();
-  if (node.permutations) {
-    for (const perm of node.permutations) {
-      for (const c of perm) classes.add(c);
+  if (isRawHtmlNode(node)) return classes;
+
+  const facts = classFactsForNode(node);
+
+  if (facts) {
+    for (const c of facts.static || []) {
+      if (typeof c === "string") classes.add(c);
     }
+    for (const c of facts.optional || []) {
+      if (typeof c === "string") classes.add(c);
+    }
+
+    for (const group of facts.exclusive || []) {
+      for (const option of group || []) {
+        for (const c of option || []) {
+          if (typeof c === "string") classes.add(c);
+        }
+      }
+    }
+
+    return classes;
   }
+
   return classes;
+}
+
+function nodeHasAlwaysClass(node, className) {
+  const facts = classFactsForNode(node);
+
+  if (facts) {
+    return (facts.static || []).includes(className);
+  }
+
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -704,40 +1540,122 @@ function collectNodeClasses(node) {
 // ---------------------------------------------------------------------------
 
 /**
- * Check if a node satisfies a segment: does any permutation contain ALL
- * required classes?
+ * Check if a node's class facts can satisfy a segment's required classes.
  *
  * Returns:
- *   "static"  — matched by a concrete permutation
+ *   "static"  — matched by known class facts
  *   "dynamic" — not matched statically, but node has dynamic entries
  *   false     — not matched at all
  */
 function nodeMatchesSegment(node, requiredClasses) {
   if (requiredClasses.length === 0) return "static";
-  if (!node.permutations) return false;
+  const facts = classFactsForNode(node);
 
-  let bestDynamic = false;
+  if (facts) {
+    const concreteClasses = collectNodeClasses(node);
+    const allKnown = requiredClasses.every((cls) => concreteClasses.has(cls));
 
-  for (const perm of node.permutations) {
-    const concreteClasses = perm.filter((c) => !isDynamic(c));
-    const hasDynamic = perm.some(isDynamic);
-
-    if (requiredClasses.every((rc) => concreteClasses.includes(rc))) {
-      return "static";
+    if (allKnown) {
+      return violatesExclusiveGroup(requiredClasses, facts.exclusive || []) ? false : "static";
     }
 
-    // Only consider dynamic if at least one required class matches statically
-    // on this same node. This prevents heroicon @name etc. from matching everything.
-    if (hasDynamic && requiredClasses.some((rc) => concreteClasses.includes(rc))) {
-      bestDynamic = true;
+    const concreteRequiredClasses = requiredClasses.filter((cls) => concreteClasses.has(cls));
+    const hasPartialStatic = concreteRequiredClasses.length > 0;
+
+    if (!hasPartialStatic) {
+      return false;
+    }
+
+    if (violatesExclusiveGroup(concreteRequiredClasses, facts.exclusive || [])) {
+      return false;
+    }
+
+    if ((facts.dynamic || []).some(isDynamic)) {
+      return "dynamic";
+    }
+
+    if (exclusiveDynamicCanCoverMissing(concreteRequiredClasses, facts.exclusive || [])) {
+      return "dynamic";
+    }
+
+    return false;
+  }
+
+  return false;
+}
+
+function violatesExclusiveGroup(requiredClasses, exclusiveGroups) {
+  const required = new Set(requiredClasses);
+
+  for (const group of exclusiveGroups) {
+    const requiredInGroup = new Set();
+
+    for (const option of group || []) {
+      for (const cls of optionConcreteClasses(option)) {
+        if (required.has(cls)) requiredInGroup.add(cls);
+      }
+    }
+
+    if (requiredInGroup.size === 0) continue;
+
+    const satisfiableByOneOption = (group || []).some((option) => {
+      const optionClasses = new Set(optionConcreteClasses(option));
+      return [...requiredInGroup].every((cls) => optionClasses.has(cls));
+    });
+
+    if (!satisfiableByOneOption) return true;
+  }
+
+  return false;
+}
+
+function exclusiveDynamicCanCoverMissing(concreteRequiredClasses, exclusiveGroups) {
+  const required = new Set(concreteRequiredClasses);
+
+  for (const group of exclusiveGroups) {
+    for (const option of group || []) {
+      if (!optionHasDynamic(option)) continue;
+      if (dynamicOptionConflictsWithRequired(option, group || [], required)) continue;
+
+      return true;
     }
   }
 
-  return bestDynamic ? "dynamic" : false;
+  return false;
+}
+
+function optionHasDynamic(option) {
+  return (option || []).some(isDynamic);
+}
+
+function dynamicOptionConflictsWithRequired(dynamicOption, group, required) {
+  const dynamicOptionClasses = new Set(optionConcreteClasses(dynamicOption));
+
+  for (const option of group) {
+    if (option === dynamicOption) continue;
+
+    for (const cls of optionConcreteClasses(option)) {
+      if (required.has(cls) && !dynamicOptionClasses.has(cls)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function optionConcreteClasses(option) {
+  return (option || []).filter((cls) => typeof cls === "string");
 }
 
 function nodeMatchesParsedSegment(node, segment) {
+  if (isRawHtmlNode(node)) return "static";
   if (segment.wildcard) return "static";
+  if (segment.tag && node.tag !== segment.tag) return false;
+  if ((segment.notClasses || []).some((cls) => nodeHasAlwaysClass(node, cls))) {
+    return false;
+  }
+
   return nodeMatchesSegment(node, segment.classes);
 }
 
@@ -748,25 +1666,26 @@ function nodeMatchesParsedSegment(node, segment) {
  *
  * Returns: { matched: boolean, dynamic: boolean, dynamicNode: object|null, unmatchedClasses: string[] }
  */
-function matchSelectorLeftward(segments, candidateEntry) {
+function matchSelectorLeftward(segments, candidateContext, graphIndex) {
   return matchSegmentAt(
     segments,
     segments.length - 1,
-    candidateEntry.node,
-    candidateEntry.ancestors,
+    candidateContext,
+    graphIndex,
     false,
     null
   );
 }
 
-function matchSegmentAt(segments, segIdx, node, ancestors, involvesDynamic, dynamicNode) {
+function matchSegmentAt(segments, segIdx, context, graphIndex, involvesDynamic, dynamicNode) {
   if (segIdx === 0) {
     return { matched: true, dynamic: involvesDynamic, dynamicNode, unmatchedClasses: [] };
   }
 
   const leftSeg = segments[segIdx - 1];
   const comb = segments[segIdx].combinator;
-  const candidates = relatedCandidates(comb, node, ancestors);
+
+  const candidates = relatedCandidates(comb, context, graphIndex);
   let dynamicFailure = null;
 
   for (const candidate of candidates) {
@@ -780,8 +1699,8 @@ function matchSegmentAt(segments, segIdx, node, ancestors, involvesDynamic, dyna
       const result = matchSegmentAt(
         segments,
         segIdx - 1,
-        candidate.node,
-        candidate.ancestors,
+        candidate,
+        graphIndex,
         nextDynamic,
         nextDynamicNode
       );
@@ -801,67 +1720,85 @@ function matchSegmentAt(segments, segIdx, node, ancestors, involvesDynamic, dyna
   };
 }
 
-function relatedCandidates(comb, node, ancestors) {
+function relatedCandidates(comb, context, index) {
   if (comb === ">") {
-    if (ancestors.length === 0) return [];
-    const parentIdx = ancestors.length - 1;
-    return [{ node: ancestors[parentIdx], ancestors: ancestors.slice(0, parentIdx) }];
+    return context.parentId == null ? [] : [index.contexts[context.parentId]];
   }
 
   if (comb === "+" || comb === "~") {
-    const parent = ancestors[ancestors.length - 1];
-    const siblings = parent && parent.children ? parent.children.filter((c) => c !== node) : [];
-    const siblingNodes = node.repeat ? [...siblings, node] : siblings;
-
-    return siblingNodes.map((sibling) => ({
-      node: sibling,
-      ancestors,
-    }));
+    return previousSiblingCandidates(comb, context, index);
   }
 
+  return [...ancestorContexts(context, index), ...ambientAncestorContexts(index)];
+}
+
+function previousSiblingCandidates(comb, context, index) {
   const candidates = [];
-  for (let idx = ancestors.length - 1; idx >= 0; idx--) {
-    candidates.push({ node: ancestors[idx], ancestors: ancestors.slice(0, idx) });
+  let siblingId = context.previousSiblingId;
+
+  while (siblingId != null) {
+    const sibling = index.contexts[siblingId];
+    if (!sibling) break;
+
+    candidates.push(sibling);
+    if (comb === "+") break;
+
+    siblingId = sibling.previousSiblingId;
   }
-  return candidates;
+
+  return context.node.repeat ? [...candidates, context] : candidates;
+}
+
+function ancestorContexts(context, index) {
+  const ancestors = [];
+  let parentId = context.parentId;
+
+  while (parentId != null) {
+    const parent = index.contexts[parentId];
+    if (!parent) break;
+    ancestors.push(parent);
+    parentId = parent.parentId;
+  }
+
+  return ancestors;
+}
+
+function ambientAncestorContexts(index) {
+  return (index.ambientAncestorIds || [])
+    .map((id) => index.contexts[id])
+    .filter(Boolean);
 }
 
 /**
  * Build the provenance path for a match: array of "tag.class1.class2" strings
  * from root to the matched node.
  */
-function buildPath(ancestors, node) {
-  const path = [];
-  for (const anc of ancestors) {
-    path.push(nodeLabel(anc));
-  }
-  path.push(nodeLabel(node));
-  return path;
+function buildPath(context, index) {
+  return [...ancestorContexts(context, index).reverse(), context].map((ctx) =>
+    nodeLabel(ctx.node)
+  );
 }
 
 /**
  * Build the human-readable chain string:
  * "functionName -> tag.classes -> tag.classes -> ... -> tag.matched"
  */
-function buildChain(functionName, ancestors, node) {
-  const parts = [functionName];
-  for (const anc of ancestors) {
-    parts.push(nodeLabel(anc));
-  }
-  parts.push(nodeLabel(node));
-  return parts.join(" \u2192 ");
+function buildChain(context, index) {
+  return [context.entryName, ...buildPath(context, index)].join(" \u2192 ");
 }
 
 /**
- * Match all parsed selectors against the classToNodes index.
+ * Match all parsed selectors against the rendered context index.
  *
- * Returns { matched, possibly_dynamic, unmatched, skipped }
+ * Returns { matched, runtime_matched, possibly_dynamic, unmatched, skipped }
  */
-function matchSelectors(parsedSelectors, classToNodes) {
+function matchSelectors(parsedSelectors, graphIndex, runtimeEvidence = new Map()) {
   const matched = [];
+  const runtimeMatched = [];
   const possiblyDynamic = [];
   const unmatched = [];
   const skipped = [];
+  graphIndex.stats.selectorCount = parsedSelectors.length;
 
   // Deduplicate selectors — same selector text can appear in multiple rules,
   // but we group them by selectorText + line
@@ -892,7 +1829,7 @@ function matchSelectors(parsedSelectors, classToNodes) {
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
 
-    const result = matchOneSelector(sel, classToNodes);
+    const result = matchOneSelector(sel, graphIndex);
 
     if (result.matches.length > 0) {
       if (result.allDynamic) {
@@ -917,48 +1854,133 @@ function matchSelectors(parsedSelectors, classToNodes) {
         line: sel.line,
         matches: result.dynamicCandidates,
       });
-    } else if (
-      sel.segments.length > 1 &&
-      isDescendantOnly(sel.segments) &&
-      crossTreeMatch(sel, classToNodes)
-    ) {
-      // All classes exist but across different component trees —
-      // descendant selectors still match in the rendered DOM
-      matched.push({
-        selector: sel.selectorText,
-        file: sel.file,
-        line: sel.line,
-        matches: [{
-          module: "(cross-component)",
-          function: "(descendant match across component boundaries)",
-          path: sel.segments.map((s) => s.classes.join(".")),
-          chain: sel.segments.map((s) => s.classes.join(".")).join(" → "),
-          dynamic: null,
-        }],
-      });
     } else {
+      const runtimeMatch = buildRuntimeSelectorMatch(sel, graphIndex, runtimeEvidence);
+
+      if (
+        runtimeMatch &&
+        runtimeCanExplainSelector(sel, graphIndex, runtimeEvidence, runtimeMatch.classes, result)
+      ) {
+        runtimeMatched.push(runtimeMatch.entry);
+        continue;
+      }
+
       unmatched.push({
         selector: sel.selectorText,
         file: sel.file,
         line: sel.line,
-        diagnostics: buildDiagnostics(sel, classToNodes),
+        diagnostics: buildDiagnostics(sel, graphIndex),
       });
     }
   }
 
-  return { matched, possibly_dynamic: possiblyDynamic, unmatched, skipped };
+  return {
+    matched,
+    runtime_matched: runtimeMatched,
+    possibly_dynamic: possiblyDynamic,
+    unmatched,
+    skipped,
+  };
+}
+
+function buildRuntimeSelectorMatch(sel, graphIndex, runtimeEvidence) {
+  if (!runtimeEvidence || runtimeEvidence.size === 0) return null;
+
+  const classes = requiredClassNamesForRuntimeEvidence(sel.selectorText);
+  const runtimeClasses = classes.filter((cls) => runtimeEvidence.has(cls));
+
+  if (classes.length === 0 || runtimeClasses.length === 0) return null;
+
+  return {
+    classes,
+    entry: {
+      selector: sel.selectorText,
+      file: sel.file,
+      line: sel.line,
+      runtime_classes: runtimeClasses,
+      classes_found: classes.filter((cls) => graphIndex.classToContexts.has(cls)),
+    },
+  };
+}
+
+function requiredClassNamesForRuntimeEvidence(selectorText) {
+  try {
+    const parsed = selectorParser().astSync(selectorText);
+    const classes = new Set();
+    parsed.walkClasses((classNode) => classes.add(classNode.value));
+    return [...classes].sort();
+  } catch {
+    return [];
+  }
+}
+
+function runtimeCanExplainSelector(sel, graphIndex, runtimeEvidence, classes, matchResult) {
+  const parsedClasses = new Set(sel.segments.flatMap((segment) => segment.classes));
+  const hasRuntimeOnlyParsedClass = classes.some(
+    (cls) => runtimeEvidence.has(cls) && !graphIndex.classToContexts.has(cls)
+  );
+  const hasRuntimePseudoClass = classes.some(
+    (cls) => runtimeEvidence.has(cls) && !parsedClasses.has(cls)
+  );
+
+  if (matchResult.matches.length > 0 && !hasRuntimeOnlyParsedClass && !hasRuntimePseudoClass) {
+    return false;
+  }
+
+  if (sel.segments.length > 1 && matchResult.matches.length === 0) {
+    const usesSiblingCombinator = sel.segments.some(
+      (segment) => segment.combinator === "+" || segment.combinator === "~"
+    );
+    if (usesSiblingCombinator) return false;
+
+    const hasHeexClass = classes.some((cls) => graphIndex.classToContexts.has(cls));
+    if (!hasHeexClass) return false;
+  }
+
+  return classes.every((cls) => graphIndex.classToContexts.has(cls) || runtimeEvidence.has(cls));
+}
+
+function buildAnalysisStats(index, parsedSelectors, results = null) {
+  return {
+    entries: index.stats.entries,
+    tree_refs: index.stats.treeRefs,
+    canonical_nodes: index.stats.canonicalNodes,
+    contexts: index.stats.contexts,
+    class_index_keys: index.stats.classIndexKeys,
+    selector_count: parsedSelectors.length,
+    max_classes_per_node: index.stats.maxClassesPerNode,
+    max_call_stack_depth: index.stats.maxCallStackDepth,
+    cycles: index.cycles.length,
+    unresolved_refs: index.unresolvedRefs.length,
+    runtime_matched_selector_count: results ? results.runtime_matched.length : 0,
+  };
+}
+
+function printAnalysisStats(stats) {
+  console.log("Analysis stats:");
+  console.log(`  entries: ${stats.entries}`);
+  console.log(`  tree refs: ${stats.tree_refs}`);
+  console.log(`  canonical nodes: ${stats.canonical_nodes}`);
+  console.log(`  contexts: ${stats.contexts}`);
+  console.log(`  class index keys: ${stats.class_index_keys}`);
+  console.log(`  selectors: ${stats.selector_count}`);
+  console.log(`  max classes per node: ${stats.max_classes_per_node}`);
+  console.log(`  max call stack depth: ${stats.max_call_stack_depth}`);
+  console.log(`  cycles: ${stats.cycles}`);
+  console.log(`  unresolved refs: ${stats.unresolved_refs}`);
+  console.log(`  runtime matched selectors: ${stats.runtime_matched_selector_count}`);
 }
 
 /**
  * Build diagnostics for an unmatched selector: which classes exist
  * somewhere in the analysis and which don't, plus structural notes.
  */
-function buildDiagnostics(sel, classToNodes) {
+function buildDiagnostics(sel, graphIndex) {
   const allSelectorClasses = sel.segments.flatMap((s) => s.classes);
   const unique = [...new Set(allSelectorClasses)];
 
-  const classesFound = unique.filter((c) => classToNodes.has(c));
-  const classesNotFound = unique.filter((c) => !classToNodes.has(c));
+  const classesFound = unique.filter((c) => graphIndex.classToContexts.has(c));
+  const classesNotFound = unique.filter((c) => !graphIndex.classToContexts.has(c));
 
   const diagnostics = { classes_found: classesFound, classes_not_found: classesNotFound };
 
@@ -976,63 +1998,32 @@ function buildDiagnostics(sel, classToNodes) {
 }
 
 /**
- * Check whether a selector uses only descendant combinators (spaces).
- * Selectors like `.a .b .c` can match across component/layout boundaries
- * because descendant relationships hold at any depth in the rendered DOM.
- */
-function isDescendantOnly(segments) {
-  for (let i = 1; i < segments.length; i++) {
-    const comb = segments[i].combinator;
-    if (comb && comb !== " ") return false;
-  }
-  return true;
-}
-
-/**
- * Cross-tree fallback for descendant-only selectors: check that every class
- * in every segment exists somewhere in the analysis. Since descendant selectors
- * match at any depth, classes split across layout/component boundaries still
- * match in the rendered HTML.
- */
-function crossTreeMatch(sel, classToNodes) {
-  for (const seg of sel.segments) {
-    for (const cls of seg.classes) {
-      if (!classToNodes.has(cls)) return false;
-    }
-  }
-  return true;
-}
-
-/**
  * Match a single selector against the index.
  *
  * Returns { matches, dynamicCandidates, allDynamic }
  */
-function matchOneSelector(sel, classToNodes) {
+function matchOneSelector(sel, graphIndex) {
   const segments = sel.segments;
   const matches = [];
   const dynamicCandidates = [];
 
   // Step 1: Find candidate nodes for the rightmost segment
   const rightmost = segments[segments.length - 1];
-  const candidateEntries = findCandidatesForSegment(
-    rightmost.classes,
-    classToNodes
-  );
+  const candidateEntries = findCandidatesForParsedSegment(rightmost, graphIndex);
 
   // Step 2: For each candidate, walk left through remaining segments
   let hasStaticMatch = false;
 
   for (const entry of candidateEntries) {
-    const rightMatchResult = nodeMatchesSegment(entry.node, rightmost.classes);
+    const rightMatchResult = nodeMatchesParsedSegment(entry.node, rightmost);
     if (!rightMatchResult) continue;
 
     const rightIsDynamic = rightMatchResult === "dynamic";
 
     if (segments.length === 1) {
       // Only one segment — just check the rightmost
-      const path = buildPath(entry.ancestors, entry.node);
-      const chain = buildChain(entry.functionName, entry.ancestors, entry.node);
+      const path = buildPath(entry, graphIndex);
+      const chain = buildChain(entry, graphIndex);
 
       if (rightIsDynamic) {
         const missingClasses = rightmost.classes.filter((c) => {
@@ -1043,8 +2034,11 @@ function matchOneSelector(sel, classToNodes) {
         });
         const dynInfo = extractDynamicInfo(entry.node);
         dynamicCandidates.push({
-          module: entry.module,
-          function: entry.functionName,
+          module: entry.entryModule,
+          function: entry.entryName,
+          entryRef: entry.entryRef,
+          definitionRef: entry.definitionRef,
+          callStack: entry.callStack,
           path,
           chain,
           dynamic: {
@@ -1055,8 +2049,11 @@ function matchOneSelector(sel, classToNodes) {
       } else {
         hasStaticMatch = true;
         matches.push({
-          module: entry.module,
-          function: entry.functionName,
+          module: entry.entryModule,
+          function: entry.entryName,
+          entryRef: entry.entryRef,
+          definitionRef: entry.definitionRef,
+          callStack: entry.callStack,
           path,
           chain,
           dynamic: null,
@@ -1066,16 +2063,19 @@ function matchOneSelector(sel, classToNodes) {
     }
 
     // Multiple segments — walk leftward
-    const leftResult = matchSelectorLeftward(segments, entry);
+    const leftResult = matchSelectorLeftward(segments, entry, graphIndex);
 
-    const path = buildPath(entry.ancestors, entry.node);
-    const chain = buildChain(entry.functionName, entry.ancestors, entry.node);
+    const path = buildPath(entry, graphIndex);
+    const chain = buildChain(entry, graphIndex);
 
     if (leftResult.matched && !leftResult.dynamic && !rightIsDynamic) {
       hasStaticMatch = true;
       matches.push({
-        module: entry.module,
-        function: entry.functionName,
+        module: entry.entryModule,
+        function: entry.entryName,
+        entryRef: entry.entryRef,
+        definitionRef: entry.definitionRef,
+        callStack: entry.callStack,
         path,
         chain,
         dynamic: null,
@@ -1084,8 +2084,11 @@ function matchOneSelector(sel, classToNodes) {
       const dynNode = rightIsDynamic ? entry.node : leftResult.dynamicNode || entry.node;
       const dynInfo = extractDynamicInfo(dynNode);
       dynamicCandidates.push({
-        module: entry.module,
-        function: entry.functionName,
+        module: entry.entryModule,
+        function: entry.entryName,
+        entryRef: entry.entryRef,
+        definitionRef: entry.definitionRef,
+        callStack: entry.callStack,
         path,
         chain,
         dynamic: {
@@ -1097,8 +2100,11 @@ function matchOneSelector(sel, classToNodes) {
       const dynNode = leftResult.dynamicNode || entry.node;
       const dynInfo = extractDynamicInfo(dynNode);
       dynamicCandidates.push({
-        module: entry.module,
-        function: entry.functionName,
+        module: entry.entryModule,
+        function: entry.entryName,
+        entryRef: entry.entryRef,
+        definitionRef: entry.definitionRef,
+        callStack: entry.callStack,
         path,
         chain,
         dynamic: {
@@ -1124,19 +2130,34 @@ function matchOneSelector(sel, classToNodes) {
 /**
  * Find all candidate index entries that could match a set of required classes.
  */
-function findCandidatesForSegment(requiredClasses, classToNodes) {
+function findCandidatesForParsedSegment(segment, graphIndex) {
+  const candidates = findCandidatesForSegment(segment.classes, graphIndex);
+
+  if (!segment.tag) return candidates;
+
+  return candidates.filter((entry) => entry.node.tag === segment.tag || isRawHtmlNode(entry.node));
+}
+
+function findCandidatesForSegment(requiredClasses, graphIndex) {
   // Use the first required class to narrow down candidates
   const candidates = new Set();
 
-  if (requiredClasses.length === 0) return classToNodes.allEntries || [];
+  if (requiredClasses.length === 0) {
+    return graphIndex.allContextIds.map((id) => graphIndex.contexts[id]);
+  }
 
   // Gather candidates from all required classes (union) so that nodes with
   // partial static + dynamic coverage are included
   for (const cls of requiredClasses) {
-    const entries = classToNodes.get(cls);
+    const entries = graphIndex.classToContexts.get(cls);
     if (entries) {
       for (const e of entries) candidates.add(e);
     }
+  }
+
+  for (const id of graphIndex.rawHtmlContextIds || []) {
+    const entry = graphIndex.contexts[id];
+    if (entry) candidates.add(entry);
   }
 
   return [...candidates];
@@ -1413,6 +2434,13 @@ async function main() {
   const cssPath = resolve(projectRoot, opts.css);
   const analysisDir = resolve(projectRoot, opts.analysis);
   const outputPath = resolve(projectRoot, opts.output);
+  const defaultJsPath = resolve(projectRoot, "assets/js");
+  const jsRoots =
+    opts.jsPaths.length > 0
+      ? opts.jsPaths.map((path) => resolve(projectRoot, path))
+      : existsSync(defaultJsPath)
+        ? [defaultJsPath]
+        : [];
 
   // Validate inputs
   if (!existsSync(cssPath)) {
@@ -1435,13 +2463,23 @@ async function main() {
   }
 
   // Phase 1: Parse CSS
-  const parsedSelectors = await parseCss(cssPath, projectRoot);
+  const nodeModulesCssEvidence = new Map();
 
-  // Phase 2: Load analysis trees
-  const classToNodes = loadAnalysisTrees(analysisDir);
+  const parsedSelectors = await parseCss(cssPath, projectRoot, {
+    includeNodeModulesCss: opts.includeNodeModulesCss,
+    nodeModulesCssEvidence,
+  });
+
+  // Phase 2: Load analysis graph
+  const graphIndex = loadGraphAnalysis(analysisDir, { maxContexts: opts.maxContexts });
+  const runtimeEvidence = mergeRuntimeEvidence(
+    buildPhoenixRuntimeClassEvidence(),
+    buildRuntimeClassEvidence(discoverJavaScriptFiles(jsRoots), projectRoot),
+    nodeModulesCssEvidence
+  );
 
   // Phase 3: Match selectors
-  const results = matchSelectors(parsedSelectors, classToNodes);
+  const results = matchSelectors(parsedSelectors, graphIndex, runtimeEvidence);
 
   // Phase 3b: Analyze keyframes
   const keyframeAnalysis = analyzeKeyframes(cssPath, projectRoot);
@@ -1453,19 +2491,32 @@ async function main() {
   }
 
   // Build output
+  const analysisStats = buildAnalysisStats(graphIndex, parsedSelectors, results);
+
   const output = {
     matched: results.matched,
+    matched_selectors: results.matched.map((entry) => entry.selector),
+    runtime_matched: results.runtime_matched,
+    runtime_matched_selectors: results.runtime_matched.map((entry) => entry.selector),
+    runtime_evidence: serializeRuntimeEvidence(runtimeEvidence),
     possibly_dynamic: results.possibly_dynamic,
     unmatched: results.unmatched,
+    unmatched_selectors: results.unmatched.map((entry) => entry.selector),
     skipped: results.skipped,
     unused_keyframes: unusedKeyframes,
+    cycles: graphIndex.cycles || [],
+    unresolved_refs: graphIndex.unresolvedRefs || [],
+    analysis_stats: analysisStats,
     summary: {
       matched: results.matched.length,
+      runtime_matched: results.runtime_matched.length,
       unmatched: results.unmatched.length,
       possibly_dynamic: results.possibly_dynamic.length,
       skipped: results.skipped.length,
       keyframes_total: keyframeAnalysis.declarations.size,
       keyframes_unused: unusedKeyframes.length,
+      cycles: graphIndex.cycles.length,
+      unresolved_refs: graphIndex.unresolvedRefs.length,
     },
   };
 
@@ -1473,12 +2524,20 @@ async function main() {
 
   const s = output.summary;
   console.log(
-    `CSS Coverage: ${s.matched} matched, ${s.unmatched} unmatched, ${s.possibly_dynamic} possibly dynamic, ${s.skipped} skipped`
+    `CSS Coverage: ${s.matched} matched, ${s.runtime_matched} runtime-matched, ${s.unmatched} unmatched, ${s.possibly_dynamic} possibly dynamic, ${s.skipped} skipped`
   );
   if (keyframeAnalysis.declarations.size > 0) {
     console.log(
       `Keyframes: ${keyframeAnalysis.declarations.size} found, ${unusedKeyframes.length} unused`
     );
+  }
+  if (output.cycles.length > 0 || output.unresolved_refs.length > 0) {
+    console.log(
+      `Graph diagnostics: ${output.cycles.length} cycles, ${output.unresolved_refs.length} unresolved refs`
+    );
+  }
+  if (opts.stats) {
+    printAnalysisStats(output.analysis_stats);
   }
 
   // List all unmatched selectors (newly unmatched + already invalidated)
@@ -1510,6 +2569,16 @@ async function main() {
       }
       console.log();
     }
+
+  }
+
+  if (opts.listRuntime) {
+    console.log(`\n--- Runtime-matched selectors (${results.runtime_matched.length}) ---`);
+    for (const e of results.runtime_matched) {
+      const loc = e.line ? `${e.file}:${e.line}` : e.file;
+      console.log(`  ${loc}  ${e.selector}`);
+    }
+    console.log();
   }
 
   // Phase 4 (optional): Invalidate unmatched selectors in source CSS

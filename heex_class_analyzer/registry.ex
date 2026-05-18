@@ -7,7 +7,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
 
   This module sits in the middle of the analyzer pipeline:
 
-      Discovery -> HeexParser -> Expression -> **Registry** -> Resolver -> Permutations -> Output
+      Discovery -> HeexParser -> Expression -> **Registry** -> Resolver -> ClassFacts -> Output
 
   ## Purpose
 
@@ -169,7 +169,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
     # Look up the function in the resolved module (try any arity, prefer arity 1)
     case find_in_module(registry, resolved_module, func_name) do
       {_mod, _info} = result -> result
-      nil -> nil
+      nil -> find_in_module_by_suffix(registry, resolved_module, func_name)
     end
   end
 
@@ -309,6 +309,28 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
       [] -> nil
       [entry | _] -> {entry.module, entry}
     end
+  end
+
+  defp find_in_module_by_suffix(registry, target_module, func_name) do
+    target_suffix = module_suffix_parts(target_module)
+    suffix_length = length(target_suffix)
+
+    registry.modules
+    |> Map.keys()
+    |> Enum.filter(fn module ->
+      module
+      |> Module.split()
+      |> Enum.take(-suffix_length)
+      |> Kernel.==(target_suffix)
+    end)
+    |> Enum.find_value(&find_in_module(registry, &1, func_name))
+  end
+
+  defp module_suffix_parts(module) when is_atom(module) do
+    module
+    |> Atom.to_string()
+    |> String.trim_leading("Elixir.")
+    |> String.split(".", trim: true)
   end
 
   defp resolve_alias(registry, calling_module, target_module) do

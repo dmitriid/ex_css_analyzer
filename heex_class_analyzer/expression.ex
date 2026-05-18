@@ -9,7 +9,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
 
   ## Pipeline Role
 
-      Discovery -> HeexParser -> **Expression** -> Registry -> Resolver -> Permutations -> Output
+      Discovery -> HeexParser -> **Expression** -> Registry -> Resolver -> ClassFacts -> Output
 
   The `Expression` module is called by the `Resolver` on each node's class
   attribute value. It takes the raw class value (a plain string, an
@@ -116,6 +116,10 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
     (e.g., `MyModule.class_helper(arg)`). Handled similarly to local calls
     by the `Resolver`.
 
+  - `{:assign_ref, assign_name}` - A HEEX assign reference such as `@tie_class`.
+    The `Resolver` may replace it with clause-local assign facts discovered
+    before the `~H` sigil.
+
   ## Expression Classification Rules
 
   The analyzer walks the Elixir AST and classifies expressions as follows:
@@ -132,7 +136,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   | `cond do ... end`            | `{:either, [branch_values...]}`       |
   | `func(args)`                 | `{:fn_call, {func, args}}`            |
   | `Mod.func(args)`             | `{:fn_call, {Mod, func, args}}`       |
-  | `@assign` / variable         | Static `["<dynamic>"]`                |
+  | `@assign`                    | `{:assign_ref, assign}` variant       |
+  | variable                     | Static `["<dynamic>"]`                |
   | Unparseable                  | Static `["<dynamic>"]`                |
 
   ## Edge Cases and Special Behaviors
@@ -165,7 +170,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   - **Called by**: `Resolver` (calls `analyze/1` on each node's class value
     and `extract_returns/1` on function bodies found via the `Registry`).
   - **Produces**: `{static_classes, variants}` tuples consumed by
-    `Permutations.compute/2` to generate all possible class combinations.
+    `ClassFacts.from_static_and_variants/2` to generate compact selector facts.
   - **Depends on**: Standard library `Code.string_to_quoted/1` for parsing
     expression strings into AST.
   """
@@ -173,6 +178,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   @type variant ::
           {:toggle, String.t()}
           | {:either, [String.t()]}
+          | {:assign_ref, atom()}
           | {:fn_call, {atom(), list()} | {module(), atom(), list()}}
 
   @spec analyze(String.t() | {:expr, String.t()} | nil) :: {[String.t()], [variant()]}
@@ -185,7 +191,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   end
 
   def analyze({:expr, expr_string}) when is_binary(expr_string) do
-    case Code.string_to_quoted(expr_string) do
+    case Code.string_to_quoted(expr_string, emit_warnings: false) do
       {:ok, ast} ->
         analyze_ast(ast)
 
@@ -218,14 +224,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   defp walk_expr({:if, _, [_condition, branches]}), do: walk_if(branches)
   defp walk_expr({:case, _, [_subject, [do: clauses]]}), do: walk_clauses(clauses)
   defp walk_expr({:cond, _, [[do: clauses]]}), do: walk_clauses(clauses)
+  defp walk_expr({:@, _, [{name, _, _}]}) when is_atom(name), do: {[], [{:assign_ref, name}]}
 
   defp walk_expr({{:., _, [{:__aliases__, _, mod_parts}, func_name]}, _, args})
        when is_atom(func_name) and is_list(args) do
     walk_remote_call(mod_parts, func_name, args)
   end
 
-  defp walk_expr({func_name, _, args})
-       when is_atom(func_name) and is_list(args) and func_name not in [:@, :^] do
+  defp walk_expr({func_name, _, args}) when is_atom(func_name) and is_list(args) and func_name not in [:@, :^] do
     walk_local_call(func_name, args)
   end
 
@@ -313,9 +319,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
         else_values = collect_branch_strings(else_ast)
 
         if else_values == [],
-          do:
-            {[],
-             [{:either, [do_str, make_dynamic("unknown_expression", Macro.to_string(else_ast))]}]},
+          do: {[], [{:either, [do_str, make_dynamic("unknown_expression", Macro.to_string(else_ast))]}]},
           else: {[], [{:either, [do_str | else_values]}]}
 
       else_str ->
@@ -350,8 +354,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   defp do_extract_returns(items) when is_list(items), do: extract_list_return(items)
   defp do_extract_returns({:if, _, [_cond, branches]}), do: extract_if_return(branches)
 
-  defp do_extract_returns({:case, _, [_subject, [do: clauses]]}),
-    do: extract_from_clauses(clauses)
+  defp do_extract_returns({:case, _, [_subject, [do: clauses]]}), do: extract_from_clauses(clauses)
 
   defp do_extract_returns({:cond, _, [[do: clauses]]}), do: extract_from_clauses(clauses)
 
@@ -369,8 +372,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
     extract_local_call_return(func_name, args)
   end
 
-  defp do_extract_returns({:@, _, _} = ast),
-    do: [[make_dynamic("assign", Macro.to_string(ast))]]
+  defp do_extract_returns({:@, _, _} = ast), do: [[make_dynamic("assign", Macro.to_string(ast))]]
 
   defp do_extract_returns({name, _, context} = ast) when is_atom(name) and is_atom(context),
     do: [[make_dynamic("variable", Macro.to_string(ast))]]

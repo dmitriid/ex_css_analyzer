@@ -1,10 +1,12 @@
 defmodule Mix.Tasks.HeexClassAnalyzer do
+  @shortdoc "Extract CSS class hierarchies from HEEX templates"
+
   @moduledoc """
   Entry point Mix task that orchestrates the full HEEX class analysis pipeline.
 
   This task statically analyzes Phoenix HEEX templates to extract CSS class
-  hierarchies, resolving dynamic expressions, component trees, and function
-  calls to produce a complete picture of all CSS classes used in the application.
+  hierarchies, resolving dynamic expressions, component edges, and function
+  calls to produce a graph of all CSS classes used in the application.
 
   ## Usage
 
@@ -12,8 +14,9 @@ defmodule Mix.Tasks.HeexClassAnalyzer do
 
   ## Options
 
-  - `--output` - Directory to write JSON output files. Defaults to `"./analysis"`.
-    The directory is cleaned of existing `.json` files before writing new output.
+  - `--output` - Directory to write `heex-class-graph.json`. Defaults to
+    `"./analysis"`. The directory is cleaned of existing `.json` files before
+    writing new output.
 
   ## Pipeline
 
@@ -27,30 +30,43 @@ defmodule Mix.Tasks.HeexClassAnalyzer do
      module/function/arity (MFA) and by name, enabling cross-module function
      resolution including imports, aliases, and `use`-based imports.
 
-  3. **Resolver** - For each discovered module, parses HEEX content, analyzes
-     class attributes to extract static classes and dynamic variants, resolves
-     `{:fn_call, ...}` references by following function definitions (up to
-     depth 10 with cycle detection), inlines component trees, and computes
-     all class permutations.
+  3. **Resolver** - Parses HEEX content, analyzes class attributes to extract
+     static classes and dynamic variants, resolves `{:fn_call, ...}` references,
+     resolves narrow assign facts captured before `~H`, emits component calls
+     as graph edges, and computes compact class facts.
 
-  4. **Output** - Writes one JSON file per module to the output directory,
-     containing the fully resolved node trees with tags, static classes,
-     variants, permutations, and children.
+     Phoenix built-ins and runtime HTML are modeled conservatively:
 
-  5. **Summary** - Prints counts of analyzed modules, functions, and templates.
+     - `<.link>` is treated as an `a` tag so selectors like `.menu a:hover`
+       can match without requiring a local component definition.
+     - Slot placeholders from `render_slot(@inner_block)` and named slots such
+       as `render_slot(@media)` are preserved in the graph so CSS coverage can
+       place caller content under the component wrapper that renders it.
+     - Standalone templates can resolve component tags like
+       `Layouts.admin_content` by registry module suffix when alias metadata is
+       unavailable.
+     - Non-slot HEEX expressions that call a helper returning
+       `Phoenix.HTML.raw/1` are serialized as raw HTML placeholders. CSS
+       coverage treats those placeholders as matching one immediate child
+       selector segment under the HEEX parent, e.g. `.markdown p`, but does not
+       assume arbitrary deep descendants such as `.markdown p strong`.
+
+  4. **Output** - Writes `analysis/heex-class-graph.json` by default,
+     containing entries, canonical trees, cycles, and unresolved refs.
+
+  5. **Summary** - Prints counts of entries, trees, and cycles.
 
   ## Error Handling
 
-  If resolution fails for a particular module (e.g., due to malformed HEEX or
-  unexpected AST structures), the error is logged as a warning and that module
-  is skipped. The task continues processing remaining modules.
+  The resolver builds the full graph in a single pass. If graph resolution
+  fails (e.g., due to malformed HEEX or unexpected AST structures), the task
+  logs a warning for the graph failure and reraises the exception.
 
   ## Output Structure
 
-  Each generated JSON file in the output directory represents one module and
-  contains its source file path, module name, and a list of functions/templates
-  with their resolved class trees. See `Mix.Tasks.HeexClassAnalyzer.Output` for
-  the full JSON schema.
+  The generated graph JSON file is graph version 2 and contains public entries,
+  canonical node trees, component cycles, and unresolved refs. See
+  `Mix.Tasks.HeexClassAnalyzer.Output` for the full JSON schema.
 
   ## Example
 
@@ -59,14 +75,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer do
       Building registry...
       Resolving 42 modules...
       Writing output...
-      Analyzed 42 modules, 87 functions, 12 templates. Output: ./css_analysis/
+      Analyzed 99 entries, 104 trees, 0 cycles. Output: ./css_analysis/heex-class-graph.json
 
   ## Interaction with Other Modules
 
   - `Discovery` - Provides `discover/1` to find and parse all source files
   - `Registry` - Provides `build/1` to create the function lookup index
-  - `Resolver` - Provides `resolve_module/2` to produce fully-resolved node trees
-  - `Output` - Provides `write_all/2` to serialize results to JSON
+  - `Resolver` - Provides `resolve_graph/2` to produce canonical graph trees
+  - `Output` - Provides `write_graph!/2` to serialize graph results to JSON
   """
 
   use Mix.Task
@@ -77,8 +93,6 @@ defmodule Mix.Tasks.HeexClassAnalyzer do
   alias Mix.Tasks.HeexClassAnalyzer.Resolver
 
   require Logger
-
-  @shortdoc "Extract CSS class hierarchies from HEEX templates"
 
   @impl Mix.Task
   def run(args) do
@@ -96,48 +110,23 @@ defmodule Mix.Tasks.HeexClassAnalyzer do
     module_count = length(module_infos)
     Mix.shell().info("Resolving #{module_count} modules...")
 
-    resolved =
-      module_infos
-      |> Enum.map(fn module_info ->
-        try do
-          {module_info, Resolver.resolve_module(module_info, registry)}
-        rescue
-          e ->
-            name = module_info.module || module_info.source_file
-            Logger.warning("Failed to resolve #{inspect(name)}: #{Exception.message(e)}")
-            nil
-        end
-      end)
-      |> Enum.reject(&is_nil/1)
+    graph =
+      try do
+        Resolver.resolve_graph(module_infos, registry)
+      rescue
+        e ->
+          Logger.warning("Failed to resolve graph: #{Exception.message(e)}")
+          reraise e, __STACKTRACE__
+      end
 
     Mix.shell().info("Writing output...")
-    clean_output_dir(output_dir)
-    Output.write_all(resolved, output_dir)
-
-    {function_count, template_count} = count_outputs(resolved)
+    Output.write_graph!(graph, output_dir)
 
     Mix.shell().info(
-      "Analyzed #{length(resolved)} modules, " <>
-        "#{function_count} functions, " <>
-        "#{template_count} templates. " <>
-        "Output: #{output_dir}/"
+      "Analyzed #{length(graph.entries)} entries, " <>
+        "#{map_size(graph.trees)} trees, " <>
+        "#{length(graph.cycles)} cycles. " <>
+        "Output: #{Path.join(output_dir, "heex-class-graph.json")}"
     )
-  end
-
-  defp clean_output_dir(output_dir) do
-    File.mkdir_p!(output_dir)
-
-    output_dir
-    |> Path.join("*.json")
-    |> Path.wildcard()
-    |> Enum.each(&File.rm!/1)
-  end
-
-  defp count_outputs(resolved) do
-    Enum.reduce(resolved, {0, 0}, fn {module_info, functions}, {fn_acc, tpl_acc} ->
-      fn_count = length(functions)
-      tpl_count = length(module_info.heex_templates)
-      {fn_acc + fn_count, tpl_acc + tpl_count}
-    end)
   end
 end
