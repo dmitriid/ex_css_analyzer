@@ -47,9 +47,10 @@ defmodule Mix.Tasks.HeexClassAnalyzer do
        unavailable.
      - Non-slot HEEX expressions that call a helper returning
        `Phoenix.HTML.raw/1` are serialized as raw HTML placeholders. CSS
-       coverage treats those placeholders as matching one immediate child
+       coverage treats those placeholders as matching one immediate tag-only
        selector segment under the HEEX parent, e.g. `.markdown p`, but does not
-       assume arbitrary deep descendants such as `.markdown p strong`.
+       assume arbitrary classes, ids, or deep descendants such as
+       `.markdown p strong`.
 
   4. **Output** - Writes `analysis/heex-class-graph.json` by default,
      containing entries, canonical trees, cycles, and unresolved refs.

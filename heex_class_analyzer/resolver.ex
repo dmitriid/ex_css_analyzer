@@ -78,9 +78,10 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
   Non-slot HEEX expressions are normally ignored because they do not define
   class structure. If an expression calls a helper whose discovered return
   clauses call `Phoenix.HTML.raw/1`, the resolver emits a raw HTML placeholder
-  instead. CSS coverage can use that placeholder for one immediate descendant
-  selector segment under the HEEX parent, which covers Markdown output like
-  `.answer p` without claiming arbitrary deep raw HTML selectors.
+  instead. CSS coverage can use that placeholder for one immediate tag-only
+  descendant selector segment under the HEEX parent, which covers Markdown
+  output like `.answer p` without claiming arbitrary raw HTML classes, ids, or
+  deep selectors.
 
   ## Interaction with Other Modules
 
@@ -930,6 +931,9 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
 
   defp stamp_direct_variant_dynamics(variants) do
     Enum.map(variants, fn
+      {:toggle, {:dynamic, info}} ->
+        {:toggle, {:dynamic, Map.put(info, :chain, info.expr)}}
+
       {:either, options} ->
         {:either,
          Enum.map(options, fn

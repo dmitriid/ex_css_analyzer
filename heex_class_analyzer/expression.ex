@@ -257,8 +257,17 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   defp walk_and(left, right) do
     case {extract_string(right), extract_string(left)} do
       {nil, nil} ->
-        expr = Macro.to_string({:&&, [], [left, right]})
-        {[make_dynamic("complex_expression", expr)], []}
+        case {collect_class_values(right), collect_class_values(left)} do
+          {[], []} ->
+            expr = Macro.to_string({:&&, [], [left, right]})
+            {[make_dynamic("complex_expression", expr)], []}
+
+          {right_values, _} when right_values != [] ->
+            {[], Enum.map(right_values, &{:toggle, &1})}
+
+          {[], left_values} ->
+            {[], Enum.map(left_values, &{:toggle, &1})}
+        end
 
       {right_str, _} when right_str != nil ->
         {[], [{:toggle, right_str}]}
@@ -469,6 +478,38 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
       str when is_binary(str) -> [str]
       {:__block__, _, exprs} -> exprs |> List.last() |> collect_branch_strings()
       _ -> []
+    end
+  end
+
+  defp collect_class_values(ast) do
+    case ast do
+      str when is_binary(str) ->
+        [str]
+
+      {:||, _, [left, right]} ->
+        collect_class_values(left) ++ collect_class_values(right)
+
+      {:if, _, [_condition, branches]} ->
+        collect_branch_strings(Keyword.get(branches, :do)) ++
+          collect_branch_strings(Keyword.get(branches, :else))
+
+      {:case, _, [_subject, [do: clauses]]} ->
+        collect_clause_strings(clauses)
+
+      {:cond, _, [[do: clauses]]} ->
+        collect_clause_strings(clauses)
+
+      {:__block__, _, exprs} ->
+        exprs |> List.last() |> collect_class_values()
+
+      {:@, _, _} = ast ->
+        [make_dynamic("assign", Macro.to_string(ast))]
+
+      {name, _, context} = ast when is_atom(name) and is_atom(context) ->
+        [make_dynamic("variable", Macro.to_string(ast))]
+
+      _ ->
+        []
     end
   end
 

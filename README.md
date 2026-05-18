@@ -152,9 +152,9 @@ The analyzer also handles several Phoenix-specific cases:
 - Standalone templates can resolve tags like `Layouts.admin_content` by module
   suffix if alias metadata is unavailable.
 - Helpers returning `Phoenix.HTML.raw/1` produce raw HTML placeholders. CSS
-  coverage lets those placeholders satisfy one immediate child selector segment
-  under the HEEX parent, such as `.markdown p`, without assuming arbitrary deep
-  descendants.
+  coverage lets those placeholders satisfy one immediate tag-only selector
+  segment under the HEEX parent, such as `.markdown p`, without assuming
+  arbitrary classes, ids, or deep descendants.
 
 ## CSS Coverage
 

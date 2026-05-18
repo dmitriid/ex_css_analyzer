@@ -1653,7 +1653,7 @@ function optionConcreteClasses(option) {
 }
 
 function nodeMatchesParsedSegment(node, segment) {
-  if (isRawHtmlNode(node)) return "static";
+  if (isRawHtmlNode(node)) return rawHtmlMatchesParsedSegment(segment) ? "static" : false;
   if (segment.wildcard) return "static";
   if (segment.tag && node.tag !== segment.tag) return false;
   if ((segment.notClasses || []).some((cls) => nodeHasAlwaysClass(node, cls))) {
@@ -1661,6 +1661,15 @@ function nodeMatchesParsedSegment(node, segment) {
   }
 
   return nodeMatchesSegment(node, segment.classes);
+}
+
+function rawHtmlMatchesParsedSegment(segment) {
+  return Boolean(
+    segment.tag &&
+      !segment.wildcard &&
+      segment.classes.length === 0 &&
+      segment.notClasses.length === 0
+  );
 }
 
 /**
