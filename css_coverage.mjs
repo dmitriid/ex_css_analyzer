@@ -46,7 +46,8 @@
  *    --output <path>     Path for the output JSON report (default: analysis/css-coverage.json)
  *    --js <path>         JavaScript file or directory to scan for runtime class strings. Can be repeated.
  *    --remove-unmatched     Remove unmatched selectors (and already-invalidated ones) from CSS source
- *    --list-unmatched       List all unmatched selectors (including already-invalidated ones) to stdout
+ *    --list-unmatched       List unmatched selectors and unused keyframes to stdout
+ *    --list-invalidated     List already-invalidated selectors and keyframes to stdout
  *    --list-runtime         List runtime-matched selectors to stdout
  *    --stats                Print graph/context analysis statistics
  *    --max-contexts <n>     Maximum rendered contexts to expand before failing (default: 250000)
@@ -278,6 +279,7 @@ function parseArgs() {
     restoreUnmatched: false,
     removeUnmatched: false,
     listUnmatched: false,
+    listInvalidated: false,
     listRuntime: false,
     stats: false,
     maxContexts: 250000,
@@ -293,7 +295,8 @@ function parseArgs() {
   --invalidate-unmatched    Prepend ${UNMATCHED_MARKER} to unmatched selectors in the CSS source
   --restore-unmatched       Remove ${UNMATCHED_MARKER} markers from all selectors in the CSS source
   --remove-unmatched           Remove unmatched selectors (and already-invalidated ones) from CSS source
-  --list-unmatched             List all unmatched selectors (including already-invalidated ones) to stdout
+  --list-unmatched             List unmatched selectors and unused keyframes to stdout
+  --list-invalidated           List already-invalidated selectors and keyframes to stdout
   --list-runtime               List all runtime-matched selectors to stdout
   --stats                      Print graph/context analysis statistics
   --max-contexts <n>           Maximum rendered contexts to expand before failing (default: 250000)
@@ -322,6 +325,8 @@ function parseArgs() {
       opts.removeUnmatched = true;
     } else if (arg === "--list-unmatched") {
       opts.listUnmatched = true;
+    } else if (arg === "--list-invalidated") {
+      opts.listInvalidated = true;
     } else if (arg === "--list-runtime") {
       opts.listRuntime = true;
     } else if (arg === "--stats") {
@@ -2502,6 +2507,7 @@ async function main() {
       unusedKeyframes.push({ name, file: info.file, line: info.line });
     }
   }
+  const invalidatedSelectors = collectInvalidatedSelectors(cssPath, projectRoot);
 
   // Build output
   const analysisStats = buildAnalysisStats(graphIndex, parsedSelectors, results);
@@ -2516,6 +2522,7 @@ async function main() {
     unmatched: results.unmatched,
     unmatched_selectors: results.unmatched.map((entry) => entry.selector),
     skipped: results.skipped,
+    invalidated_selectors: invalidatedSelectors,
     unused_keyframes: unusedKeyframes,
     cycles: graphIndex.cycles || [],
     unresolved_refs: graphIndex.unresolvedRefs || [],
@@ -2524,10 +2531,12 @@ async function main() {
       matched: results.matched.length,
       runtime_matched: results.runtime_matched.length,
       unmatched: results.unmatched.length,
+      invalidated: invalidatedSelectors.length,
       possibly_dynamic: results.possibly_dynamic.length,
       skipped: results.skipped.length,
       keyframes_total: keyframeAnalysis.declarations.size,
       keyframes_unused: unusedKeyframes.length,
+      keyframes_invalidated: keyframeAnalysis.invalidated.length,
       cycles: graphIndex.cycles.length,
       unresolved_refs: graphIndex.unresolvedRefs.length,
     },
@@ -2537,11 +2546,11 @@ async function main() {
 
   const s = output.summary;
   console.log(
-    `CSS Coverage: ${s.matched} matched, ${s.runtime_matched} runtime-matched, ${s.unmatched} unmatched, ${s.possibly_dynamic} possibly dynamic, ${s.skipped} skipped`
+    `CSS Coverage: ${s.matched} matched, ${s.runtime_matched} runtime-matched, ${s.unmatched} unmatched, ${s.invalidated} invalidated, ${s.possibly_dynamic} possibly dynamic, ${s.skipped} skipped`
   );
   if (keyframeAnalysis.declarations.size > 0) {
     console.log(
-      `Keyframes: ${keyframeAnalysis.declarations.size} found, ${unusedKeyframes.length} unused`
+      `Keyframes: ${keyframeAnalysis.declarations.size} found, ${unusedKeyframes.length} unused, ${keyframeAnalysis.invalidated.length} invalidated`
     );
   }
   if (output.cycles.length > 0 || output.unresolved_refs.length > 0) {
@@ -2553,36 +2562,49 @@ async function main() {
     printAnalysisStats(output.analysis_stats);
   }
 
-  // List all unmatched selectors (newly unmatched + already invalidated)
+  // List current unmatched selectors and unused keyframes.
   if (opts.listUnmatched) {
-    const invalidated = collectInvalidatedSelectors(cssPath, projectRoot);
-    const all = [
-      ...results.unmatched.map((e) => ({ selector: e.selector, file: e.file, line: e.line, status: "unmatched" })),
-      ...invalidated.map((e) => ({ ...e, status: "invalidated" })),
-    ];
-    all.sort((a, b) => (a.file || "").localeCompare(b.file || "") || (a.line || 0) - (b.line || 0));
-    console.log(`\n--- Unmatched selectors (${all.length}) ---`);
-    for (const e of all) {
+    const unmatched = results.unmatched.map((e) => ({
+      selector: e.selector,
+      file: e.file,
+      line: e.line,
+    }));
+
+    unmatched.sort((a, b) => (a.file || "").localeCompare(b.file || "") || (a.line || 0) - (b.line || 0));
+    console.log(`\n--- Unmatched selectors (${unmatched.length}) ---`);
+    for (const e of unmatched) {
       const loc = e.line ? `${e.file}:${e.line}` : e.file;
-      const tag = e.status === "invalidated" ? " [invalidated]" : "";
-      console.log(`  ${loc}  ${e.selector}${tag}`);
+      console.log(`  ${loc}  ${e.selector}`);
     }
     console.log();
 
-    const allUnusedKeyframes = [
-      ...unusedKeyframes.map((e) => ({ ...e, status: "unmatched" })),
-      ...keyframeAnalysis.invalidated.map((e) => ({ ...e, status: "invalidated" })),
-    ];
-    if (allUnusedKeyframes.length > 0) {
-      console.log(`--- Unused keyframes (${allUnusedKeyframes.length}) ---`);
-      for (const e of allUnusedKeyframes) {
+    if (unusedKeyframes.length > 0) {
+      console.log(`--- Unused keyframes (${unusedKeyframes.length}) ---`);
+      for (const e of unusedKeyframes) {
         const loc = e.line ? `${e.file}:${e.line}` : e.file;
-        const tag = e.status === "invalidated" ? " [invalidated]" : "";
-        console.log(`  ${loc}  @keyframes ${e.name}${tag}`);
+        console.log(`  ${loc}  @keyframes ${e.name}`);
       }
       console.log();
     }
+  }
 
+  if (opts.listInvalidated) {
+    invalidatedSelectors.sort((a, b) => (a.file || "").localeCompare(b.file || "") || (a.line || 0) - (b.line || 0));
+    console.log(`\n--- Invalidated selectors (${invalidatedSelectors.length}) ---`);
+    for (const e of invalidatedSelectors) {
+      const loc = e.line ? `${e.file}:${e.line}` : e.file;
+      console.log(`  ${loc}  ${e.selector}`);
+    }
+    console.log();
+
+    if (keyframeAnalysis.invalidated.length > 0) {
+      console.log(`--- Invalidated keyframes (${keyframeAnalysis.invalidated.length}) ---`);
+      for (const e of keyframeAnalysis.invalidated) {
+        const loc = e.line ? `${e.file}:${e.line}` : e.file;
+        console.log(`  ${loc}  @keyframes ${e.name}`);
+      }
+      console.log();
+    }
   }
 
   if (opts.listRuntime) {
