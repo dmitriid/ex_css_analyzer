@@ -241,9 +241,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { resolve, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import postcss from "postcss";
-import postcssImport from "postcss-import";
-import selectorParser from "postcss-selector-parser";
+import { createRequire } from "node:module";
 
 // ---------------------------------------------------------------------------
 // Utility: find project root by walking up looking for mix.exs
@@ -260,6 +258,12 @@ function findProjectRoot() {
   console.error("ERROR: Could not find project root (no mix.exs found).");
   process.exit(1);
 }
+
+const PROJECT_ROOT = findProjectRoot();
+const requireFromProject = createRequire(join(PROJECT_ROOT, "package.json"));
+const postcss = requireFromProject("postcss");
+const postcssImport = requireFromProject("postcss-import");
+const selectorParser = requireFromProject("postcss-selector-parser");
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing
@@ -2429,7 +2433,7 @@ function removeUnmatchedSelectors(cssPath, unmatchedEntries, projectRoot) {
 // ---------------------------------------------------------------------------
 async function main() {
   const opts = parseArgs();
-  const projectRoot = findProjectRoot();
+  const projectRoot = PROJECT_ROOT;
 
   const cssPath = resolve(projectRoot, opts.css);
   const analysisDir = resolve(projectRoot, opts.analysis);
