@@ -7,7 +7,9 @@ two parts:
 2. `css_coverage.mjs` compares `assets/css/app.css` against that graph and
    reports matched, runtime-matched, dynamic, unmatched, and skipped selectors.
 
-Parts of this repository are written or updated with LLMs.
+This repository is LLM-generated tooling. That is why it is not released on
+Hex.pm: there is already enough slop in package registries as it is. Treat this
+as source you can inspect, adapt, and own inside your app.
 
 ## Caveat
 
