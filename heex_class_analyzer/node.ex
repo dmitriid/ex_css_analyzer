@@ -55,6 +55,10 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
   - `:repeat` - Whether the element has a HEEx `:for` attribute and may render
     multiple sibling copies of itself.
 
+  - `:slot_bindings` - Parser-only metadata from HEEx `:for` expressions such
+    as `btn <- @button`, used to bind `render_slot(btn, ...)` back to the
+    named slot `:button` before resolver output is serialized.
+
   ## Examples
 
       # A simple div with static classes
@@ -97,7 +101,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
           variants: [variant()],
           classes: class_facts(),
           children: [child()],
-          repeat: boolean()
+          repeat: boolean(),
+          slot_bindings: %{optional(String.t()) => String.t()}
         }
 
   defstruct tag: nil,
@@ -105,5 +110,6 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Node do
             variants: [],
             classes: %{static: [], optional: [], exclusive: [], dynamic: []},
             children: [],
-            repeat: false
+            repeat: false,
+            slot_bindings: %{}
 end

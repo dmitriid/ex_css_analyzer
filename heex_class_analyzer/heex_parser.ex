@@ -126,6 +126,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
     heex_string
     |> tokenize()
     |> build_tree()
+    |> bind_slot_placeholders()
   end
 
   # --- Tokenizer ---
@@ -173,9 +174,9 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
   defp tokenize("{" <> rest, acc) do
     {expr, remaining} = read_brace_expression(rest, 1, "")
 
-    case render_slot_name(expr) do
+    case render_slot_tag(expr) do
       nil -> tokenize(remaining, [{:self_close, expression_tag(expr), %{}} | acc])
-      slot_name -> tokenize(remaining, [{:self_close, "__slot__:#{slot_name}", %{}} | acc])
+      tag -> tokenize(remaining, [{:self_close, tag, %{}} | acc])
     end
   end
 
@@ -313,7 +314,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
   defp parse_attr_name(input), do: parse_attr_name(input, "")
 
   defp parse_attr_name(<<c, rest::binary>>, acc)
-       when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?- or c == ?_ or c == ?: or c == ?@ or c == ?. do
+       when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?- or c == ?_ or c == ?: or c == ?@ or
+              c == ?. do
     parse_attr_name(rest, acc <> <<c>>)
   end
 
@@ -485,32 +487,62 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
     "__expr__:#{encoded}"
   end
 
-  defp render_slot_name(expr) when is_binary(expr) do
+  defp render_slot_tag(expr) when is_binary(expr) do
     expr = String.trim_leading(expr)
 
     if String.starts_with?(expr, "render_slot") do
-      parse_render_slot_name(expr)
+      parse_render_slot_tag(expr)
     end
   end
 
-  defp parse_render_slot_name(expr) do
+  defp parse_render_slot_tag(expr) do
     with {:ok, ast} <- Code.string_to_quoted(expr, emit_warnings: false),
-         {:ok, name} <- render_slot_name_from_ast(ast) do
-      Atom.to_string(name)
+         {:ok, type, name} <- render_slot_from_ast(ast) do
+      render_slot_tag(type, name)
     else
       _ -> nil
     end
   end
 
-  defp render_slot_name_from_ast({:render_slot, _, [{{:., _, [{:assigns, _, _}, name]}, _, []}]}) when is_atom(name) do
-    {:ok, name}
+  defp render_slot_tag("name", name), do: "__slot__:#{name}"
+  defp render_slot_tag("var", name), do: "__slot_var__:#{name}"
+
+  defp render_slot_from_ast({:render_slot, _, [{{:., _, [{:assigns, _, _}, name]}, _, []} | _]})
+       when is_atom(name) do
+    {:ok, "name", Atom.to_string(name)}
   end
 
-  defp render_slot_name_from_ast({:render_slot, _, [{:@, _, [{name, _, _}]}]}) when is_atom(name) do
-    {:ok, name}
+  defp render_slot_from_ast({:render_slot, _, [{:@, _, [{name, _, _}]} | _]})
+       when is_atom(name) do
+    {:ok, "name", Atom.to_string(name)}
   end
 
-  defp render_slot_name_from_ast(_ast), do: :error
+  defp render_slot_from_ast({:render_slot, _, [{var_name, _, nil} | _]})
+       when is_atom(var_name) do
+    {:ok, "var", Atom.to_string(var_name)}
+  end
+
+  defp render_slot_from_ast(_ast), do: :error
+
+  defp bind_slot_placeholders(nodes) do
+    bind_slot_placeholders(nodes, %{})
+  end
+
+  defp bind_slot_placeholders(nodes, slot_bindings) do
+    Enum.map(nodes, &bind_slot_placeholder(&1, slot_bindings))
+  end
+
+  defp bind_slot_placeholder(%Node{tag: "__slot_var__:" <> var_name} = node, slot_bindings) do
+    case Map.fetch(slot_bindings, var_name) do
+      {:ok, slot_name} -> %{node | tag: "__slot__:#{slot_name}"}
+      :error -> node
+    end
+  end
+
+  defp bind_slot_placeholder(%Node{} = node, slot_bindings) do
+    child_slot_bindings = Map.merge(slot_bindings, node.slot_bindings)
+    %{node | children: bind_slot_placeholders(node.children, child_slot_bindings)}
+  end
 
   # --- Tree builder ---
 
@@ -600,6 +632,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
       tag: tag,
       static: class_value,
       repeat: repeat?(attrs),
+      slot_bindings: slot_bindings(attrs),
       children: children
     }
   end
@@ -614,4 +647,27 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
   end
 
   defp repeat?(attrs), do: Map.has_key?(attrs, ":for")
+
+  defp slot_bindings(attrs) do
+    case Map.get(attrs, ":for") do
+      {:expr, expr} -> slot_bindings_from_for_expr(expr)
+      _ -> %{}
+    end
+  end
+
+  defp slot_bindings_from_for_expr(expr) do
+    with {:ok, ast} <- Code.string_to_quoted(expr, emit_warnings: false),
+         {:ok, var_name, slot_name} <- slot_binding_from_for_ast(ast) do
+      %{Atom.to_string(var_name) => Atom.to_string(slot_name)}
+    else
+      _ -> %{}
+    end
+  end
+
+  defp slot_binding_from_for_ast({:<-, _, [{var_name, _, nil}, {:@, _, [{slot_name, _, _}]}]})
+       when is_atom(var_name) and is_atom(slot_name) do
+    {:ok, var_name, slot_name}
+  end
+
+  defp slot_binding_from_for_ast(_ast), do: :error
 end

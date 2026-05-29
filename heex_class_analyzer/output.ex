@@ -83,7 +83,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Output do
     %{
       version: graph.version,
       entries: graph.entries,
-      trees: Map.new(graph.trees, fn {ref, tree} -> {ref, Enum.map(tree, &serialize_child/1)} end),
+      trees:
+        Map.new(graph.trees, fn {ref, tree} -> {ref, Enum.map(tree, &serialize_child/1)} end),
       cycles: graph.cycles,
       unresolved: graph.unresolved
     }

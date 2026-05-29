@@ -280,7 +280,9 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   end
 
   # Multi-alias: alias Foo.{Bar, Baz}
-  defp extract_alias_entries({:alias, _, [{{:., _, [{:__aliases__, _, prefix}, :{}]}, _, suffixes}]}) do
+  defp extract_alias_entries(
+         {:alias, _, [{{:., _, [{:__aliases__, _, prefix}, :{}]}, _, suffixes}]}
+       ) do
     Enum.map(suffixes, fn {:__aliases__, _, suffix_parts} ->
       full = Module.concat(prefix ++ suffix_parts)
       short = List.last(suffix_parts)
@@ -361,7 +363,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
     {name, arity, body}
   end
 
-  defp extract_function_def({kind, _, [{name, _, args}, [do: body]]}) when kind in [:def, :defp] and is_atom(name) do
+  defp extract_function_def({kind, _, [{name, _, args}, [do: body]]})
+       when kind in [:def, :defp] and is_atom(name) do
     arity = if is_list(args), do: length(args), else: 0
     {name, arity, body}
   end
@@ -373,7 +376,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   end
 
   # One-liner: def foo(x), do: expr
-  defp extract_function_def({kind, _, [{name, _, args}]}) when kind in [:def, :defp] and is_atom(name) do
+  defp extract_function_def({kind, _, [{name, _, args}]})
+       when kind in [:def, :defp] and is_atom(name) do
     arity = if is_list(args), do: length(args), else: 0
     {name, arity, nil}
   end
@@ -420,11 +424,16 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
     end)
   end
 
-  defp assign_fact({:=, _, [{:assigns, _, _}, {:|>, _, [_assigns_ast, {:assign, _, [assign_name_ast, expr_ast]}]}]}) do
+  defp assign_fact(
+         {:=, _,
+          [{:assigns, _, _}, {:|>, _, [_assigns_ast, {:assign, _, [assign_name_ast, expr_ast]}]}]}
+       ) do
     assign_fact_from_name(assign_name_ast, expr_ast)
   end
 
-  defp assign_fact({:=, _, [{:assigns, _, _}, {:assign, _, [{:assigns, _, _}, assign_name_ast, expr_ast]}]}) do
+  defp assign_fact(
+         {:=, _, [{:assigns, _, _}, {:assign, _, [{:assigns, _, _}, assign_name_ast, expr_ast]}]}
+       ) do
     assign_fact_from_name(assign_name_ast, expr_ast)
   end
 

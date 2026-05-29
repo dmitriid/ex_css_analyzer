@@ -174,7 +174,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
       else: heex_list
   end
 
-  defp ensure_graph_tree(%{ref: ref}, _registry, _stack, %{trees: trees} = state) when is_map_key(trees, ref) do
+  defp ensure_graph_tree(%{ref: ref}, _registry, _stack, %{trees: trees} = state)
+       when is_map_key(trees, ref) do
     {Map.fetch!(trees, ref), state}
   end
 
@@ -191,7 +192,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     {tree, state}
   end
 
-  defp ensure_graph_tree_for_function(resolved_module, func_info, clause_index, registry, stack, state) do
+  defp ensure_graph_tree_for_function(
+         resolved_module,
+         func_info,
+         clause_index,
+         registry,
+         stack,
+         state
+       ) do
     heex =
       func_info
       |> function_heex_clauses()
@@ -216,13 +224,29 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     )
   end
 
-  defp resolve_heex_tree(heex_string, assign_facts, calling_module, registry, current_ref, stack, state) do
+  defp resolve_heex_tree(
+         heex_string,
+         assign_facts,
+         calling_module,
+         registry,
+         current_ref,
+         stack,
+         state
+       ) do
     heex_string
     |> HeexParser.parse()
     |> resolve_graph_children(assign_facts, calling_module, registry, current_ref, stack, state)
   end
 
-  defp resolve_graph_children(children, assign_facts, calling_module, registry, current_ref, stack, state) do
+  defp resolve_graph_children(
+         children,
+         assign_facts,
+         calling_module,
+         registry,
+         current_ref,
+         stack,
+         state
+       ) do
     Enum.reduce(children, {[], state}, fn child, {children_acc, acc} ->
       {resolved_child, acc} =
         resolve_graph_child(
@@ -301,7 +325,15 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     end
   end
 
-  defp resolve_graph_child(%Node{tag: tag} = node, assign_facts, calling_module, registry, current_ref, stack, state)
+  defp resolve_graph_child(
+         %Node{tag: tag} = node,
+         assign_facts,
+         calling_module,
+         registry,
+         current_ref,
+         stack,
+         state
+       )
        when is_binary(tag) do
     case phoenix_builtin_component_tag(tag) do
       nil ->
@@ -328,11 +360,27 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     end
   end
 
-  defp resolve_graph_child(node, assign_facts, calling_module, registry, current_ref, stack, state) do
+  defp resolve_graph_child(
+         node,
+         assign_facts,
+         calling_module,
+         registry,
+         current_ref,
+         stack,
+         state
+       ) do
     resolve_graph_node(node, assign_facts, calling_module, registry, current_ref, stack, state)
   end
 
-  defp resolve_graph_component_child(node, assign_facts, calling_module, registry, current_ref, stack, state) do
+  defp resolve_graph_component_child(
+         node,
+         assign_facts,
+         calling_module,
+         registry,
+         current_ref,
+         stack,
+         state
+       ) do
     case component_edge_for_tag(node.tag, calling_module, registry, current_ref, stack, state) do
       {nil, state} ->
         resolve_graph_node(
@@ -373,7 +421,15 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
   defp phoenix_builtin_component_tag(".link"), do: "a"
   defp phoenix_builtin_component_tag(_tag), do: nil
 
-  defp resolve_transparent_children(node, assign_facts, calling_module, registry, current_ref, stack, state) do
+  defp resolve_transparent_children(
+         node,
+         assign_facts,
+         calling_module,
+         registry,
+         current_ref,
+         stack,
+         state
+       ) do
     resolve_graph_children(
       node.children,
       assign_facts,
@@ -385,7 +441,16 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     )
   end
 
-  defp resolve_component_call_node(node, edge, assign_facts, calling_module, registry, current_ref, stack, state) do
+  defp resolve_component_call_node(
+         node,
+         edge,
+         assign_facts,
+         calling_module,
+         registry,
+         current_ref,
+         stack,
+         state
+       ) do
     {resolved_slots, state} =
       resolve_component_slot_children(
         node.children,
@@ -424,7 +489,15 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     end
   end
 
-  defp resolve_component_slot_children(children, assign_facts, calling_module, registry, current_ref, stack, state) do
+  defp resolve_component_slot_children(
+         children,
+         assign_facts,
+         calling_module,
+         registry,
+         current_ref,
+         stack,
+         state
+       ) do
     {slots, state} =
       Enum.reduce(children, {%{}, state}, fn child, {slots_acc, acc} ->
         {slot_name, slot_nodes} = component_slot_node(child)
@@ -449,13 +522,15 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     {slots, state}
   end
 
-  defp component_slot_node(%Node{tag: ":" <> slot_name, children: children}), do: {slot_name, children}
+  defp component_slot_node(%Node{tag: ":" <> slot_name, children: children}),
+    do: {slot_name, children}
 
   defp component_slot_node(node), do: {"inner_block", [node]}
 
   defp maybe_put_slot_children(edge, slots) when map_size(slots) == 0, do: edge
 
-  defp maybe_put_slot_children(edge, %{"inner_block" => slot_children} = slots) when map_size(slots) == 1 do
+  defp maybe_put_slot_children(edge, %{"inner_block" => slot_children} = slots)
+       when map_size(slots) == 1 do
     edge
     |> Map.put(:slot_children, slot_children)
     |> Map.put(:slot_children_by_name, slots)
@@ -483,7 +558,11 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     String.match?(expr, ~r/^\s*(?:[A-Z]\w*(?:\.[A-Z]\w*)*\.)?[a-z_]\w*[!?]?\s*\(/)
   end
 
-  defp raw_html_ast?({{:., _, [{:__aliases__, _, mod_parts}, func_name]}, _, args}, calling_module, registry)
+  defp raw_html_ast?(
+         {{:., _, [{:__aliases__, _, mod_parts}, func_name]}, _, args},
+         calling_module,
+         registry
+       )
        when is_atom(func_name) and is_list(args) do
     case Registry.resolve_remote(registry, calling_module, Module.concat(mod_parts), func_name) do
       {_module, entry} -> function_returns_phoenix_raw?(entry.function)
@@ -552,7 +631,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
      }, state}
   end
 
-  defp component_edge_for_tag("." <> func_name_str = tag, calling_module, registry, current_ref, stack, state) do
+  defp component_edge_for_tag(
+         "." <> func_name_str = tag,
+         calling_module,
+         registry,
+         current_ref,
+         stack,
+         state
+       ) do
     func_name = String.to_atom(func_name_str)
 
     registry
@@ -560,7 +646,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     |> component_edge_from_lookup(tag, current_ref, registry, stack, state)
   end
 
-  defp component_edge_for_tag(tag, calling_module, registry, current_ref, stack, state) when is_binary(tag) do
+  defp component_edge_for_tag(tag, calling_module, registry, current_ref, stack, state)
+       when is_binary(tag) do
     if String.contains?(tag, ".") && starts_with_uppercase?(tag) do
       parts = String.split(tag, ".")
       func_name = parts |> List.last() |> String.to_atom()
@@ -579,7 +666,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     end
   end
 
-  defp component_edge_for_tag(_tag, _calling_module, _registry, _current_ref, _stack, state), do: {nil, state}
+  defp component_edge_for_tag(_tag, _calling_module, _registry, _current_ref, _stack, state),
+    do: {nil, state}
 
   defp remote_component_modules([short_name]) do
     short_atom = String.to_atom(short_name)
@@ -593,7 +681,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     {:unresolved, update_in(state.unresolved, &[unresolved | &1])}
   end
 
-  defp component_edge_from_lookup({resolved_module, entry}, tag, current_ref, registry, stack, state) do
+  defp component_edge_from_lookup(
+         {resolved_module, entry},
+         tag,
+         current_ref,
+         registry,
+         stack,
+         state
+       ) do
     refs =
       entry.function
       |> function_heex_clauses()
@@ -629,7 +724,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
 
   # --- Function call variant resolution ---
 
-  defp resolve_class_variants(variants, assign_facts, calling_module, registry, visited_fns, depth) do
+  defp resolve_class_variants(
+         variants,
+         assign_facts,
+         calling_module,
+         registry,
+         visited_fns,
+         depth
+       ) do
     Enum.reduce(variants, {[], []}, fn variant, {var_acc, static_acc} ->
       case variant do
         {:assign_ref, name} ->
@@ -661,13 +763,21 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     end
   end
 
-  defp assign_expr_to_resolution(str, _calling_module, _registry, _visited_fns, _depth) when is_binary(str) do
+  defp assign_expr_to_resolution(str, _calling_module, _registry, _visited_fns, _depth)
+       when is_binary(str) do
     {:statics, String.split(str, ~r/\s+/, trim: true)}
   end
 
-  defp assign_expr_to_resolution(nil, _calling_module, _registry, _visited_fns, _depth), do: {:statics, []}
+  defp assign_expr_to_resolution(nil, _calling_module, _registry, _visited_fns, _depth),
+    do: {:statics, []}
 
-  defp assign_expr_to_resolution({func_name, _meta, args}, calling_module, registry, visited_fns, depth)
+  defp assign_expr_to_resolution(
+         {func_name, _meta, args},
+         calling_module,
+         registry,
+         visited_fns,
+         depth
+       )
        when is_atom(func_name) and is_list(args) and func_name not in [:@, :^] do
     resolve_fn_call({func_name, args}, calling_module, registry, visited_fns, depth, [])
   end
@@ -695,20 +805,25 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     {:statics, [{:dynamic, %{reason: "unresolved:assign_expr", expr: expr, chain: expr}}]}
   end
 
-  defp merge_resolved({:variants, new_variants}, {var_acc, static_acc}), do: {var_acc ++ new_variants, static_acc}
+  defp merge_resolved({:variants, new_variants}, {var_acc, static_acc}),
+    do: {var_acc ++ new_variants, static_acc}
 
-  defp merge_resolved({:statics, new_statics}, {var_acc, static_acc}), do: {var_acc, static_acc ++ new_statics}
+  defp merge_resolved({:statics, new_statics}, {var_acc, static_acc}),
+    do: {var_acc, static_acc ++ new_statics}
 
-  defp resolve_fn_call(_fn_ref, _calling_module, _registry, _visited, depth, chain) when depth >= @max_depth do
+  defp resolve_fn_call(_fn_ref, _calling_module, _registry, _visited, depth, chain)
+       when depth >= @max_depth do
     chain_str = build_chain(chain, "<max depth>")
 
     {:statics,
      [
-       {:dynamic, %{reason: "unresolved:max_depth", expr: "max depth #{@max_depth}", chain: chain_str}}
+       {:dynamic,
+        %{reason: "unresolved:max_depth", expr: "max depth #{@max_depth}", chain: chain_str}}
      ]}
   end
 
-  defp resolve_fn_call({func_name, _args}, calling_module, registry, visited, depth, chain) when is_atom(func_name) do
+  defp resolve_fn_call({func_name, _args}, calling_module, registry, visited, depth, chain)
+       when is_atom(func_name) do
     resolve_fn_lookup(
       Registry.resolve_local(registry, calling_module, func_name),
       func_name,
@@ -719,7 +834,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     )
   end
 
-  defp resolve_fn_call({module, func_name, _args}, calling_module, registry, visited, depth, chain)
+  defp resolve_fn_call(
+         {module, func_name, _args},
+         calling_module,
+         registry,
+         visited,
+         depth,
+         chain
+       )
        when is_atom(module) and is_atom(func_name) do
     resolve_fn_lookup(
       Registry.resolve_remote(registry, calling_module, module, func_name),
@@ -740,7 +862,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
   defp resolve_fn_lookup(nil, func_name, _registry, _visited, _depth, chain) do
     chain_str = build_chain(chain, "#{func_name} (unknown)")
 
-    {:statics, [{:dynamic, %{reason: "unresolved:unknown_fn", expr: "#{func_name}", chain: chain_str}}]}
+    {:statics,
+     [{:dynamic, %{reason: "unresolved:unknown_fn", expr: "#{func_name}", chain: chain_str}}]}
   end
 
   defp resolve_fn_lookup({resolved_module, entry}, func_name, registry, visited, depth, chain) do
@@ -810,7 +933,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
     end)
   end
 
-  defp resolve_nested_fn_call_returns(nested_fn_calls, resolved_module, registry, visited, depth, chain) do
+  defp resolve_nested_fn_call_returns(
+         nested_fn_calls,
+         resolved_module,
+         registry,
+         visited,
+         depth,
+         chain
+       ) do
     Enum.flat_map(nested_fn_calls, fn fn_ref ->
       case resolve_fn_call(fn_ref, resolved_module, registry, visited, depth, chain) do
         {:variants, variants} -> collect_strings_from_variants(variants)
@@ -834,7 +964,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
 
         {:statics,
          [
-           {:dynamic, %{reason: "unresolved:no_returns", expr: "no extractable returns", chain: chain_str}}
+           {:dynamic,
+            %{reason: "unresolved:no_returns", expr: "no extractable returns", chain: chain_str}}
          ]}
 
       {[single], true} ->
@@ -883,7 +1014,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
 
   defp partition_string("", strings, fn_calls, _has_empty_return?), do: {strings, fn_calls, true}
 
-  defp partition_string(str, strings, fn_calls, has_empty_return?), do: {strings ++ [str], fn_calls, has_empty_return?}
+  defp partition_string(str, strings, fn_calls, has_empty_return?),
+    do: {strings ++ [str], fn_calls, has_empty_return?}
 
   defp class_list_to_class_value(classes) do
     if Enum.all?(classes, &is_binary/1) do

@@ -231,7 +231,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
     walk_remote_call(mod_parts, func_name, args)
   end
 
-  defp walk_expr({func_name, _, args}) when is_atom(func_name) and is_list(args) and func_name not in [:@, :^] do
+  defp walk_expr({func_name, _, args})
+       when is_atom(func_name) and is_list(args) and func_name not in [:@, :^] do
     walk_local_call(func_name, args)
   end
 
@@ -328,7 +329,9 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
         else_values = collect_branch_strings(else_ast)
 
         if else_values == [],
-          do: {[], [{:either, [do_str, make_dynamic("unknown_expression", Macro.to_string(else_ast))]}]},
+          do:
+            {[],
+             [{:either, [do_str, make_dynamic("unknown_expression", Macro.to_string(else_ast))]}]},
           else: {[], [{:either, [do_str | else_values]}]}
 
       else_str ->
@@ -363,7 +366,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   defp do_extract_returns(items) when is_list(items), do: extract_list_return(items)
   defp do_extract_returns({:if, _, [_cond, branches]}), do: extract_if_return(branches)
 
-  defp do_extract_returns({:case, _, [_subject, [do: clauses]]}), do: extract_from_clauses(clauses)
+  defp do_extract_returns({:case, _, [_subject, [do: clauses]]}),
+    do: extract_from_clauses(clauses)
 
   defp do_extract_returns({:cond, _, [[do: clauses]]}), do: extract_from_clauses(clauses)
 
@@ -481,37 +485,38 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
     end
   end
 
-  defp collect_class_values(ast) do
-    case ast do
-      str when is_binary(str) ->
-        [str]
+  defp collect_class_values(str) when is_binary(str), do: [str]
 
-      {:||, _, [left, right]} ->
-        collect_class_values(left) ++ collect_class_values(right)
-
-      {:if, _, [_condition, branches]} ->
-        collect_branch_strings(Keyword.get(branches, :do)) ++
-          collect_branch_strings(Keyword.get(branches, :else))
-
-      {:case, _, [_subject, [do: clauses]]} ->
-        collect_clause_strings(clauses)
-
-      {:cond, _, [[do: clauses]]} ->
-        collect_clause_strings(clauses)
-
-      {:__block__, _, exprs} ->
-        exprs |> List.last() |> collect_class_values()
-
-      {:@, _, _} = ast ->
-        [make_dynamic("assign", Macro.to_string(ast))]
-
-      {name, _, context} = ast when is_atom(name) and is_atom(context) ->
-        [make_dynamic("variable", Macro.to_string(ast))]
-
-      _ ->
-        []
-    end
+  defp collect_class_values({:||, _, [left, right]}) do
+    collect_class_values(left) ++ collect_class_values(right)
   end
+
+  defp collect_class_values({:if, _, [_condition, branches]}) do
+    collect_branch_strings(Keyword.get(branches, :do)) ++
+      collect_branch_strings(Keyword.get(branches, :else))
+  end
+
+  defp collect_class_values({:case, _, [_subject, [do: clauses]]}) do
+    collect_clause_strings(clauses)
+  end
+
+  defp collect_class_values({:cond, _, [[do: clauses]]}) do
+    collect_clause_strings(clauses)
+  end
+
+  defp collect_class_values({:__block__, _, exprs}) do
+    exprs |> List.last() |> collect_class_values()
+  end
+
+  defp collect_class_values({:@, _, _} = ast) do
+    [make_dynamic("assign", Macro.to_string(ast))]
+  end
+
+  defp collect_class_values({name, _, context} = ast) when is_atom(name) and is_atom(context) do
+    [make_dynamic("variable", Macro.to_string(ast))]
+  end
+
+  defp collect_class_values(_), do: []
 
   defp collect_clause_strings(clauses) when is_list(clauses) do
     Enum.flat_map(clauses, fn
