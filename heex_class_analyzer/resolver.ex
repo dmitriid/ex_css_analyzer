@@ -76,12 +76,12 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
   from one component into another.
 
   Non-slot HEEX expressions are normally ignored because they do not define
-  class structure. If an expression calls a helper whose discovered return
-  clauses call `Phoenix.HTML.raw/1`, the resolver emits a raw HTML placeholder
-  instead. CSS coverage can use that placeholder for one immediate tag-only
-  descendant selector segment under the HEEX parent, which covers Markdown
-  output like `.answer p` without claiming arbitrary raw HTML classes, ids, or
-  deep selectors.
+  class structure. The resolver emits a raw HTML placeholder for direct or
+  imported `Phoenix.HTML.raw/1` calls. It also emits a placeholder for helpers
+  that use these calls. CSS coverage can use the placeholder for one immediate
+  tag-only descendant selector segment under the HEEX parent. This covers
+  Markdown output such as `.answer p`. It does not claim arbitrary raw HTML
+  classes, IDs, or deep selectors.
 
   ## Interaction with Other Modules
 
@@ -559,42 +559,85 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
   end
 
   defp raw_html_ast?(
+         {{:., _, [{:__aliases__, _, [:Phoenix, :HTML]}, :raw]}, _, [_arg]},
+         _calling_module,
+         _registry
+       ),
+       do: true
+
+  defp raw_html_ast?(
          {{:., _, [{:__aliases__, _, mod_parts}, func_name]}, _, args},
          calling_module,
          registry
        )
        when is_atom(func_name) and is_list(args) do
     case Registry.resolve_remote(registry, calling_module, Module.concat(mod_parts), func_name) do
-      {_module, entry} -> function_returns_phoenix_raw?(entry.function)
+      {_module, entry} -> function_returns_phoenix_raw?(entry, registry)
       nil -> false
     end
+  end
+
+  defp raw_html_ast?({:raw, _, [_arg]}, calling_module, registry) do
+    imported_raw_call?(registry, calling_module, MapSet.new())
   end
 
   defp raw_html_ast?({func_name, _, args}, calling_module, registry)
        when is_atom(func_name) and is_list(args) and func_name not in [:@, :^] do
     case Registry.resolve_local(registry, calling_module, func_name) do
-      {_module, entry} -> function_returns_phoenix_raw?(entry.function)
+      {_module, entry} -> function_returns_phoenix_raw?(entry, registry)
       nil -> false
     end
   end
 
   defp raw_html_ast?(_ast, _calling_module, _registry), do: false
 
-  defp function_returns_phoenix_raw?(func_info) do
-    Enum.any?(func_info.clauses || [], &contains_phoenix_raw_call?/1)
+  defp function_returns_phoenix_raw?(entry, registry, seen \\ MapSet.new()) do
+    key = {entry.module, entry.function.name, entry.function.arity}
+
+    if MapSet.member?(seen, key) do
+      false
+    else
+      function_clauses_return_phoenix_raw?(entry, registry, MapSet.put(seen, key))
+    end
   end
 
-  defp contains_phoenix_raw_call?(ast) do
+  defp function_clauses_return_phoenix_raw?(entry, registry, seen) do
+    imports = entry.module_info.imports || []
+
+    Enum.any?(
+      entry.function.clauses || [],
+      &contains_phoenix_raw_call?(&1, entry.module, imports, registry, seen)
+    )
+  end
+
+  defp contains_phoenix_raw_call?(ast, module, imports, registry, seen) do
     {_ast, found?} =
       Macro.prewalk(ast, false, fn
-        {{:., _, [{:__aliases__, _, [:Phoenix, :HTML]}, :raw]}, _, _} = node, _acc ->
+        {{:., _, [{:__aliases__, _, [:Phoenix, :HTML]}, :raw]}, _, [_arg]} = node, _acc ->
           {node, true}
+
+        {:raw, _, [_arg]} = node, acc ->
+          {node, acc or imported_raw_call?(registry, module, seen, imports)}
 
         node, acc ->
           {node, acc}
       end)
 
     found?
+  end
+
+  defp imported_raw_call?(registry, module, seen, imports \\ nil) do
+    case Registry.lookup(registry, module, :raw, 1) do
+      nil -> Phoenix.HTML in (imports || module_imports(registry, module))
+      entry -> function_returns_phoenix_raw?(entry, registry, seen)
+    end
+  end
+
+  defp module_imports(registry, module) do
+    case Registry.get_module(registry, module) do
+      %{imports: imports} -> imports
+      _module_info -> []
+    end
   end
 
   defp resolve_graph_node(node, assign_facts, calling_module, registry, current_ref, stack, state) do

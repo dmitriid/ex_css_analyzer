@@ -405,13 +405,14 @@ async function parseCss(cssPath, projectRoot, opts = {}) {
       // harvested as runtime class evidence.
       if (
         /^@import\s+["']tailwindcss["']/.test(trimmed) ||
+        /^@import\s+["']phoenix-colocated\//.test(trimmed) ||
         /^@import\s+(url\()?["']?https?:\/\//.test(trimmed)
       ) {
-        return "/* [css-coverage: skipped] " + trimmed + " */";
+        return "/* [css-coverage: skipped import] */";
       }
       // Skip Tailwind-specific at-rules that postcss can't parse
       if (/^@(source|plugin)\s/.test(trimmed)) {
-        return "/* [css-coverage: skipped] " + trimmed + " */";
+        return "/* [css-coverage: skipped tailwind directive] */";
       }
       return line;
     })

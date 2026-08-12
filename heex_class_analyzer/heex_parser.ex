@@ -517,8 +517,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
     {:ok, "name", Atom.to_string(name)}
   end
 
-  defp render_slot_from_ast({:render_slot, _, [{var_name, _, nil} | _]})
-       when is_atom(var_name) do
+  defp render_slot_from_ast({:render_slot, _, [{var_name, _, nil} | _]}) when is_atom(var_name) do
     {:ok, "var", Atom.to_string(var_name)}
   end
 

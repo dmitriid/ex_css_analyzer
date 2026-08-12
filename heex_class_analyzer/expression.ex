@@ -454,10 +454,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
         end
       end)
 
-    case results do
-      :unresolved -> :unresolved
-      list -> list
-    end
+    results
   end
 
   defp extract_from_clauses(_), do: :unresolved
