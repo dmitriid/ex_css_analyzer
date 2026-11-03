@@ -1,24 +1,26 @@
 defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
   @moduledoc """
-  Tokenizes and parses HEEX template strings into `Node` trees.
+  Splits HEEX template strings into tokens and parses them into `Node` trees.
 
-  This module is the second stage in the analyzer pipeline, taking raw HEEX
-  template content (discovered by `Discovery`) and producing a tree of `Node`
-  structs representing the element hierarchy with their class attributes
-  extracted.
+  HeexParser is the second analyzer stage. It receives the raw HEEX content
+  from `Discovery`. The result is a tree of `Node` structs with the element
+  hierarchy and the class attributes of each element.
 
-  ## Pipeline Role
+  ## Stage order
 
       Discovery -> **HeexParser** -> Expression -> Registry -> Resolver -> ClassFacts -> Output
 
-  The `HeexParser` receives a HEEX string and returns a list of root `Node`
-  structs. At this stage, nodes have their `tag` and `static` fields populated.
-  The `static` field contains the raw class attribute value -- either a plain
-  string for static classes, an `{:expr, code}` tuple for dynamic expressions,
-  or an empty list if no class attribute is present. Nodes with HEEx `:for`
-  also get `repeat: true`, preserving the fact that one template node may
-  render multiple sibling elements. Later pipeline stages (Resolver/Expression)
-  analyze these values further.
+  `parse/1` receives a HEEX string and returns a list of root `Node`
+  structs. At this stage, only the `tag` and `static` fields contain data.
+  The `static` field contains the raw class attribute value:
+
+  - A plain string for static classes
+  - An `{:expr, code}` tuple for a dynamic expression
+  - An empty list if the element has no class attribute
+
+  A node with HEEx `:for` also gets `repeat: true`. One such template node
+  can render several sibling elements. The later stages, `Resolver` and
+  `Expression`, analyze these values.
 
   ## Public API
 
@@ -41,80 +43,87 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
       [%Node{tag: "p", static: "note", repeat: true, children: []}]
 
   ## Parsing Details
+  ## Parser details
 
-  ### Tokenization
+  ### Tokens
 
-  The parser first tokenizes the input into a flat list of tokens:
+  The parser first splits the input into a flat list of tokens:
 
-  - `{:open, tag, attrs}` - An opening tag with its attributes map
-  - `{:close, tag}` - A closing tag
-  - `{:self_close, tag, attrs}` - A self-closing tag (explicit `/>` or void element)
+  - `{:open, tag, attrs}`. An opening tag with its attributes map.
+  - `{:close, tag}`. A closing tag.
+  - `{:self_close, tag, attrs}`. A self-closing tag, with an explicit `/>`
+    or as a void element.
 
-  ### Tag Name Support
+  ### Tag names
 
-  The tokenizer recognizes several tag name formats:
+  The tokenizer accepts these tag name formats:
 
-  - **HTML tags**: `div`, `span`, `section`, etc.
-  - **Phoenix function components**: `.func` (local) or `Module.func` (remote)
-  - **Slots**: `:inner_block`, `:col`, etc. (prefixed with colon)
+  - HTML tags. `div`, `span`, `section`, and other tags.
+  - Phoenix function components. `.func` for a local call or `Module.func`
+    for a remote call.
+  - Slots. A name with a colon prefix, for example `:inner_block` or `:col`.
 
-  ### Attribute Handling
+  ### Attributes
 
-  Attributes are parsed into a map. The class attribute value is extracted as:
+  The parser puts the attributes into a map. The class attribute value is
+  one of these forms:
 
   - A plain string for `class="static classes"`
   - An `{:expr, code}` tuple for `class={dynamic_expression}`
-  - `repeat: true` metadata for elements with HEEx `:for`
-  - `true` for boolean attributes (no value)
-  - Only `class` and the presence of `:for` are preserved in the output nodes;
-    other attributes are discarded.
+  - `true` for a boolean attribute without a value
 
-  ### Void Elements
+  An element with HEEx `:for` gets `repeat: true`. The output nodes keep
+  only `class` and the presence of `:for`. The parser discards all other
+  attributes.
 
-  HTML void elements (`area`, `base`, `br`, `col`, `embed`, `hr`, `img`,
-  `input`, `link`, `meta`, `param`, `source`, `track`, `wbr`) are
-  automatically treated as self-closing regardless of whether they have
-  an explicit `/>`.
+  ### Void elements
 
-  ### Skipped Content
+  The parser always reads these HTML void elements as self-closing tags,
+  with or without an explicit `/>`:
 
-  The following are recognized and skipped (not included in the output tree):
+  `area`, `base`, `br`, `col`, `embed`, `hr`, `img`, `input`, `link`,
+  `meta`, `param`, `source`, `track`, `wbr`
+
+  ### Skipped content
+
+  The parser finds and skips these items. They are not in the output tree.
 
   - HEEX comments: `<%!-- ... --%>`
   - HTML comments: `<!-- ... -->`
   - EEx expressions: `<%= ... %>` and `<% ... %>`
-  - HEEX expressions at the text level: `{...}` (top-level curly brace blocks)
-  - Plain text content between tags
+  - HEEX expressions at the text level, that is top-level `{...}` blocks
+  - Plain text between tags
 
-  ### Tree Building
+  ### Tree
 
-  After tokenization, the flat token list is assembled into a tree using a
-  stack-based algorithm. The builder handles:
+  After the tokenizer, a stack algorithm makes a tree from the flat token
+  list. The algorithm accepts these inputs:
 
-  - Properly nested elements (normal case)
-  - Unclosed tags (treated as best-effort; popped from the stack as orphans)
-  - Mismatched closing tags (unmatched close tags are skipped)
-  - Nested string literals, heredocs, sigils, and charlists within `{...}`
-    expressions (correctly balanced braces)
+  - Correctly nested elements
+  - Unclosed tags. The algorithm removes them from the stack as orphans.
+  - Closing tags without a matching opening tag. The algorithm skips them.
+  - String literals, heredocs, sigils, and charlists in `{...}` expressions.
+    The braces in these items do not change the brace depth.
 
-  ## Edge Cases
+  ## Special cases
 
-  - Malformed HTML is handled gracefully: unclosed tags are finalized when
-    input is exhausted, and unmatched closing tags are silently skipped.
-  - Deeply nested `{...}` expressions with internal braces, strings, and
-    sigils are correctly parsed by tracking brace depth and recognizing
-    string delimiters.
-  - An invalid opening tag (e.g., `< `) causes the `<` character to be
-    skipped and parsing continues.
-  - Empty input returns an empty list.
+  - Malformed HTML. At the end of the input, the parser closes all unclosed
+    tags. It skips closing tags without a matching opening tag and reports
+    nothing.
+  - Nested `{...}` expressions. The parser counts the brace depth and finds
+    string delimiters. Braces, strings, and sigils in the expression do not
+    end it too early.
+  - Invalid opening tags. For input such as `< `, the parser skips the `<`
+    character and continues.
+  - Empty input. The result is an empty list.
 
-  ## Interaction with Other Modules
+  ## Related modules
 
-  - **Input**: Raw HEEX strings from `Discovery` (extracted from `~H` sigils,
-    `.heex` files, or `render/1` functions).
-  - **Output**: `[Node.t()]` consumed by `Resolver`, which calls
-    `Expression.analyze/1` on each node's `static` field and then
-    `ClassFacts.from_static_and_variants/2` to fill in compact class facts.
+  - `Discovery`. Supplies the raw HEEX strings from `~H` sigils, `.heex`
+    files, and `render/1` functions.
+  - `Resolver`. Receives the `[Node.t()]` result. Calls
+    `Expression.analyze/1` on the `static` field of each node. After that,
+    calls `ClassFacts.from_static_and_variants/2` to add compact class facts.
   """
 
   alias Mix.Tasks.HeexClassAnalyzer.Node
@@ -170,7 +179,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
     end
   end
 
-  # HEEX expression: {expr} — skip entire expression block
+  # HEEX expression: {expr} . skip entire expression block
   defp tokenize("{" <> rest, acc) do
     {expr, remaining} = read_brace_expression(rest, 1, "")
 
@@ -297,7 +306,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
             parse_tag_attrs(rest, tag, attrs)
 
           nil ->
-            # Skip one character and try again (graceful handling)
+            # The attribute is not valid. Skip one character and parse the rest.
             <<_::utf8, rest::binary>> = input
             parse_tag_attrs(rest, tag, attrs)
         end
@@ -364,7 +373,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
     read_quoted_string(rest, quote, acc <> <<c::utf8>>)
   end
 
-  # Read a brace-delimited expression, handling nested braces, strings, and charlists
+  # Reads an expression in braces. Nested braces, strings, and charlists do not end the expression.
   defp read_brace_expression("", _depth, acc), do: {acc, ""}
 
   defp read_brace_expression("}" <> rest, 1, acc) do
@@ -610,7 +619,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.HeexParser do
   end
 
   defp pop_to_matching(tag, [{other_tag, other_attrs, other_children} | rest], orphans) do
-    # This intermediate tag is unclosed; turn it into a node and add as orphan
+    # This intermediate tag is unclosed. turn it into a node and add as orphan
     node = make_node(other_tag, other_attrs, Enum.reverse(other_children))
     pop_to_matching(tag, rest, [node | orphans])
   end

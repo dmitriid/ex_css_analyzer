@@ -1,50 +1,51 @@
 defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
   @moduledoc """
-  Indexes all discovered modules and functions for fast lookup during expression
-  resolution. Supports exact MFA (module/function/arity) lookup, local function
-  resolution with import/use chain traversal, and remote function resolution with
-  alias expansion.
+  Makes an index of all discovered modules and functions for the expression
+  resolution. The index supports these lookups:
 
-  This module sits in the middle of the analyzer pipeline:
+  - Exact lookup by module, function, and arity (MFA)
+  - Local calls, through the import and `use` chains
+  - Remote calls, after alias expansion
+
+  Registry is in the middle of the analyzer stages:
 
       Discovery -> HeexParser -> Expression -> **Registry** -> Resolver -> ClassFacts -> Output
 
   ## Purpose
 
-  After Discovery has extracted all module metadata, the Registry builds a
-  searchable index so the Resolver can quickly find function definitions when it
-  encounters function calls in class expressions. This is essential because HEEX
-  templates use both local calls (e.g. `classes(assigns)`) and remote calls
-  (e.g. `Components.button_classes()`) that need to be traced back to their
-  definitions for static analysis.
+  Discovery collects the module data. From this data, the Registry makes an
+  index. With the index, the Resolver finds the definition of each function
+  call in a class expression. HEEX templates contain local calls, for example
+  `classes(assigns)`. They also contain remote calls, for example
+  `Components.button_classes()`. Static analysis must find the definitions
+  of both types of call.
 
   ## Public API
 
   ### `build(module_infos)`
 
-  Constructs a registry from a list of `Discovery.module_info()` maps.
+  Makes a registry from a list of `Discovery.module_info()` maps.
 
       iex> registry = Registry.build(Discovery.discover("/path/to/project"))
       %{by_mfa: %{...}, by_name: %{...}, modules: %{...}}
 
   ### `lookup(registry, module, func_name, arity)`
 
-  Exact MFA lookup. Returns the function entry map or `nil`.
+  Finds a function by exact MFA. Returns the function entry map or `nil`.
 
       iex> Registry.lookup(registry, MyAppWeb.Components, :button_class, 1)
       %{function: %{name: :button_class, arity: 1, ...}, module: MyAppWeb.Components, module_info: %{...}}
 
   ### `resolve_local(registry, calling_module, func_name)`
 
-  Resolves a local (unqualified) function call from the perspective of
-  `calling_module`. Searches in this order:
+  Finds the definition of a local call without a module name in
+  `calling_module`. The search order:
 
-  1. Functions defined in `calling_module` itself
-  2. Functions in modules imported by `calling_module`
-  3. Functions in modules brought in via `use` (including implied imports like
-     `Phoenix.Component` from `use Phoenix.LiveView`)
-  4. Global fallback: any module in the registry that defines a function with
-     that name
+  1. Functions in `calling_module`
+  2. Functions in the modules that `calling_module` imports
+  3. Functions in the modules from `use`, with the imports that `use` adds.
+     For example, `use Phoenix.LiveView` adds `Phoenix.Component`.
+  4. Global fallback: a module in the registry with a function of that name
 
   Returns `{module, entry}` or `nil`.
 
@@ -53,8 +54,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
 
   ### `resolve_remote(registry, calling_module, target_module, func_name)`
 
-  Resolves a remote (qualified) function call like `Components.card_class(...)`.
-  Expands `target_module` using the alias map of `calling_module` before lookup.
+  Finds the definition of a remote call, for example `Components.card_class(...)`.
+  Before the lookup, expands `target_module` with the alias map of `calling_module`.
 
   Returns `{module, entry}` or `nil`.
 
@@ -68,7 +69,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
       iex> Registry.get_module(registry, MyAppWeb.PageLive)
       %{module: MyAppWeb.PageLive, imports: [...], aliases: %{...}, ...}
 
-  ## Key Data Structures
+  ## Data structures
 
   ### Registry (`t()`)
 
@@ -86,47 +87,50 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
   | `module`      | `atom()`                   | The module that defines this function         |
   | `module_info` | `Discovery.module_info()`  | Full metadata of the defining module          |
 
-  ## Resolution Strategy Details
+  ## Resolution rules
 
-  ### Local Resolution Order
+  ### Order for local calls
 
-  The four-step resolution mimics how Elixir resolves function calls at compile time:
+  The four steps follow the order that Elixir uses at compile time:
 
-  1. **Own module** - direct definitions take highest priority.
-  2. **Imports** - explicitly imported modules are checked next.
-  3. **Use'd modules** - modules brought in via `use` may imply additional imports.
-     The registry knows that `use Phoenix.LiveView` implies `import Phoenix.Component`,
-     and that `use MyAppWeb, :html` implies `import Phoenix.Component`.
-  4. **Global fallback** - if all else fails, search any registered module. This
-     handles cases where the import chain is incomplete in static analysis.
+  1. Own module. Definitions in the calling module come first.
+  2. Imports. The registry looks in the imported modules next.
+  3. Modules from `use`. A `use` call can add imports. The registry adds
+     `import Phoenix.Component` for `use Phoenix.LiveView` and for
+     `use MyAppWeb, :html`.
+  4. Global fallback. If the first three steps find nothing, the registry
+     looks in all modules. Static analysis does not always find the full
+     import chain.
 
-  ### Arity Preference
+  ### Arity
 
-  When multiple arities exist for a function, arity 1 is preferred. This matches
-  the Phoenix component convention where components accept a single `assigns` argument.
+  If a function has several arities, the registry selects arity 1. Phoenix
+  components accept one `assigns` argument.
 
-  ### Alias Expansion
+  ### Alias expansion
 
-  Remote calls use the short alias form (e.g. `Components.foo()`). The registry
-  expands these using the calling module's alias map before lookup. If no alias
-  matches, the atom is used as-is (assumed to be a fully qualified module).
+  Remote calls use the short alias name, for example `Components.foo()`.
+  Before the lookup, the registry expands the name with the alias map of
+  the calling module. If no alias matches, the registry uses the atom as a
+  full module name.
 
-  ## Edge Cases
+  ## Special cases
 
-  - Modules with `module: nil` (bare files without `defmodule`) are not indexed
-    in the `modules` map but their functions are still registered in `by_mfa` and
-    `by_name` with a `nil` module key.
-  - If `resolve_local/3` finds no match anywhere, it returns `nil` rather than
-    raising, allowing the Resolver to handle unresolved calls gracefully.
-  - The global fallback in `resolve_local/3` returns the first registered entry
-    for a given name, which may be arbitrary if multiple modules define the same
-    function name.
+  - Files without `defmodule`. The `modules` map does not contain these
+    files. Their functions are in `by_mfa` and `by_name` with a `nil`
+    module key.
+  - No match. If `resolve_local/3` finds no function, it returns `nil` and
+    does not raise. The Resolver handles the unresolved call.
+  - Several modules with the same function name. The global fallback in
+    `resolve_local/3` returns the first registered entry for that name.
+    The order of the entries is not defined.
 
-  ## Interaction with Other Modules
+  ## Related modules
 
-  - **Input**: Consumes the output of `Mix.Tasks.HeexClassAnalyzer.Discovery.discover/1`.
-  - **Consumer**: Used by the Resolver module to trace function calls back to their
-    definitions, enabling extraction of class values from function bodies.
+  - `Mix.Tasks.HeexClassAnalyzer.Discovery`. `discover/1` supplies the
+    input of `build/1`.
+  - Resolver. Uses the registry to find the definitions of function calls.
+    After that, it reads the class values from the function bodies.
   """
 
   alias Mix.Tasks.HeexClassAnalyzer.Discovery
@@ -245,7 +249,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
         result
 
       nil ->
-        # 3. Functions in modules brought in via `use` (e.g., Phoenix.Component)
+        # 3. Functions in modules brought in via `use` (for example, Phoenix.Component)
         uses = if module_info, do: module_info.uses, else: []
 
         case find_in_used_modules(registry, uses, func_name) do
@@ -337,7 +341,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
     module_info = get_module(registry, calling_module)
 
     if module_info do
-      # target_module might be a short alias atom like :Components
+      # target_module can be a short alias atom like :Components
       # We need to check if it matches any alias key
       Map.get(module_info.aliases, target_module, target_module)
     else

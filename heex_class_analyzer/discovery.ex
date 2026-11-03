@@ -1,28 +1,27 @@
 defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   @moduledoc """
-  Scans a Phoenix project's web layer to discover all Elixir modules and HEEX
-  templates, extracting metadata needed for downstream static analysis.
+  Finds the Elixir modules and HEEX templates in the web code of a Phoenix
+  project. Collects the data that the later analyzer stages use.
 
-  This is the first stage of the analyzer pipeline:
+  Discovery is the first analyzer stage:
 
       **Discovery** -> HeexParser -> Expression -> Registry -> Resolver -> ClassFacts -> Output
 
   ## Purpose
 
-  The Discovery module builds a comprehensive inventory of the project's web code
-  by scanning `lib/*_web/` for `.ex` and `.heex` files. For each `.ex` file it
-  parses the source via `Code.string_to_quoted/2` and extracts:
+  Discovery reads the `.ex` and `.heex` files under `lib/*_web/`. It parses
+  each `.ex` file with `Code.string_to_quoted/2` and collects these items:
 
-  - Module name(s), including nested `defmodule` declarations
-  - `import` directives (which modules are imported)
-  - `alias` directives (short name to full module mappings, including multi-alias syntax)
-  - `use` directives (which behaviours/extensions are applied)
-  - Function definitions (`def`/`defp`) with their bodies, arity, and all clauses
-  - Inline `~H` sigil content from function bodies
-  - `embed_templates` resolution (locates and reads associated `.html.heex` files)
+  - Module names, with nested `defmodule` declarations
+  - `import` directives
+  - `alias` directives, with the multi-alias syntax
+  - `use` directives
+  - Function definitions (`def` and `defp`) with their bodies, arity, and clauses
+  - `~H` sigil content from function bodies
+  - The `.html.heex` files that `embed_templates` refers to
 
-  For standalone `.heex` files not already associated with a module via
-  `embed_templates`, it reads their content and wraps them in a module_info struct.
+  A standalone `.heex` file that no `embed_templates` call refers to becomes
+  a separate `module_info` entry with the file content.
 
   ## Public API
 
@@ -30,13 +29,14 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
 
   ### Parameters
 
-  - `base_path` - The project root path (e.g. `"/home/user/my_app"`). The function
-    will glob `lib/*_web/**/*.ex` and `lib/*_web/**/*.heex` relative to this path.
+  - `base_path`. The project root, for example `"/home/user/my_app"`. The
+    function reads `lib/*_web/**/*.ex` and `lib/*_web/**/*.heex` in this
+    directory.
 
-  ### Return Value
+  ### Return value
 
-  Returns a list of `module_info()` maps. Each map represents either a discovered
-  Elixir module or a standalone HEEX template file.
+  A list of `module_info()` maps. Each map is a discovered Elixir module or
+  a standalone HEEX template file.
 
   ### Example
 
@@ -54,18 +54,18 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
         ...
       ]
 
-  ## Key Data Structures
+  ## Data structures
 
   ### `module_info()` map
 
   | Field             | Type                          | Description                                                |
   |-------------------|-------------------------------|------------------------------------------------------------|
-  | `module`          | `atom() \\| nil`              | Fully qualified module name, or `nil` for bare files       |
+  | `module`          | `atom() \\| nil`              | Full module name, or `nil` for a file without a module     |
   | `source_file`     | `String.t()`                  | Path relative to `base_path`                               |
-  | `imports`         | `[atom()]`                    | List of imported module atoms                              |
-  | `aliases`         | `%{atom() => atom()}`         | Map of short alias atom to full module name                |
-  | `uses`            | `[atom()]`                    | List of modules referenced in `use` declarations           |
-  | `functions`       | `[function_info()]`           | All `def`/`defp` functions found in the module             |
+  | `imports`         | `[atom()]`                    | Imported modules                                           |
+  | `aliases`         | `%{atom() => atom()}`         | Short alias name to full module name                       |
+  | `uses`            | `[atom()]`                    | Modules in `use` declarations                              |
+  | `functions`       | `[function_info()]`           | All `def` and `defp` functions in the module               |
   | `heex_templates`  | `[%{name: String.t(), content: String.t()}]` | Templates from `embed_templates` or standalone `.heex` files |
 
   ### `function_info()` map
@@ -74,33 +74,35 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   |-----------|-------------------------|----------------------------------------------------------|
   | `name`    | `atom()`                | Function name                                            |
   | `arity`   | `non_neg_integer()`     | Number of parameters                                     |
-  | `body`    | `Macro.t()`             | AST of the first clause's body                           |
-  | `heex`    | `String.t() \\| nil`    | Extracted `~H` sigil content (interpolations as `{...}`) |
-  | `heex_assign_facts` | `[map()]`       | Per-HEEX-clause assign facts visible before the sigil    |
+  | `body`    | `Macro.t()`             | AST of the body of the first clause                      |
+  | `heex`    | `String.t() \\| nil`    | `~H` sigil content, with interpolations as `{...}`       |
+  | `heex_assign_facts` | `[map()]`       | Assign facts before the sigil, one list per HEEX clause  |
   | `clauses` | `[Macro.t()]`           | AST bodies of all function clauses                       |
 
-  ## Edge Cases and Special Behaviors
+  ## Special cases
 
-  - **Nested modules**: `defmodule` declarations nested inside other modules are
-    discovered recursively. Each gets its own `module_info` entry.
-  - **Bare files**: `.ex` files that don't contain a `defmodule` (e.g. config-like
-    scripts) produce a single entry with `module: nil`.
-  - **Multi-alias syntax**: `alias Foo.{Bar, Baz}` is correctly expanded into
-    separate alias entries for `Bar` and `Baz`.
-  - **HEEX deduplication**: Standalone `.heex` files are skipped if their basename
-    matches a template already loaded via `embed_templates` in any discovered module.
-  - **`~H` sigil interpolation**: Elixir expressions inside `~H` sigils are replaced
-    with the placeholder string `{...}` since they cannot be statically evaluated.
-  - **Guard clauses**: Function definitions with `when` guards are handled correctly;
-    the guard is stripped and only the body is captured.
-  - **One-liner functions**: `def foo(x), do: expr` with no explicit `do...end` block
-    records the body as `nil`.
-  - **Parse failures**: Files that fail to read or parse log a warning and are skipped.
+  - Nested modules. Discovery finds `defmodule` declarations in other
+    modules. Each nested module gets a separate `module_info` entry.
+  - Files without a module. An `.ex` file without `defmodule`, for example
+    a configuration script, gives one entry with `module: nil`.
+  - Multi-alias syntax. `alias Foo.{Bar, Baz}` gives two alias entries,
+    `Bar` and `Baz`.
+  - Duplicate templates. Discovery skips a standalone `.heex` file if an
+    `embed_templates` call in a discovered module already loaded a
+    template with the same base name.
+  - `~H` interpolation. Discovery replaces each Elixir expression in a
+    `~H` sigil with the placeholder `{...}`. Static analysis cannot
+    evaluate these expressions.
+  - Guards. Discovery removes the `when` guard and keeps only the body.
+  - One-line functions. A `def foo(x), do: expr` definition without a
+    `do...end` block gets the body `nil`.
+  - Parse errors. Discovery logs a warning and skips a file that it cannot
+    read or parse.
 
-  ## Interaction with Other Modules
+  ## Use by other modules
 
-  The output of `discover/1` is consumed directly by `Mix.Tasks.HeexClassAnalyzer.Registry`
-  to build a lookup index for module/function resolution during expression evaluation.
+  `Mix.Tasks.HeexClassAnalyzer.Registry` uses the result of `discover/1` to
+  make an index of modules and functions for the expression analysis.
   """
 
   require Logger
@@ -204,7 +206,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
     end)
   end
 
-  # Recursively finds all defmodule nodes in the AST, including nested ones.
+  # Finds all `defmodule` nodes in the AST. The result contains the nested modules too.
   defp find_defmodules({:defmodule, _, [module_alias, [do: body]]}, acc) do
     module_name = resolve_module_name(module_alias)
     nested = find_defmodules(body, [])
@@ -571,11 +573,6 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
   defp collect_nodes_acc({left, right}, predicate, acc) do
     acc = collect_nodes_acc(left, predicate, acc)
     collect_nodes_acc(right, predicate, acc)
-  end
-
-  defp collect_nodes_acc([{:do, body} | rest], predicate, acc) do
-    acc = collect_nodes_acc(body, predicate, acc)
-    collect_nodes_acc(rest, predicate, acc)
   end
 
   defp collect_nodes_acc(_other, _predicate, acc), do: acc

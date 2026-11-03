@@ -2,8 +2,9 @@ defmodule Mix.Tasks.HeexClassAnalyzer do
   @shortdoc "Extract CSS class hierarchies from HEEX templates"
 
   @moduledoc """
-  Static analysis of HEEX templates. Extracts CSS class hierarchies, resolves dynamic expressions
-  and component edges, and writes the result as a JSON graph.
+  Reads the HEEX templates of the project and writes their CSS class
+  hierarchies as a JSON graph. The graph includes dynamic class expressions
+  and the edges between components.
 
   ## Usage
 
@@ -11,46 +12,55 @@ defmodule Mix.Tasks.HeexClassAnalyzer do
 
   ## Options
 
-  - `--output` - Directory for `heex-class-graph.json`. Default: `"./analysis"`.
-    The task deletes existing `.json` files in the directory before it writes.
+  - `--output`. The directory for `heex-class-graph.json`. The default is
+    `"./analysis"`. Before the task writes the file, it deletes all `.json`
+    files in this directory.
 
-  ## Pipeline
+  ## Stages
 
-  The task runs these stages in order:
+  The task runs these stages in this order:
 
-  1. **Discovery** - Scans `.ex` and `.heex` files under `lib/*_web/`.
-     Finds modules, functions with `~H` sigils, imports, aliases, uses,
-     and templates registered through `embed_templates/1`.
+  1. Discovery. Reads the `.ex` and `.heex` files under `lib/*_web/`.
+     Finds modules, functions with `~H` sigils, imports, aliases, `use`
+     calls, and templates from `embed_templates/1`.
 
-  2. **Registry** - Builds a function index keyed by module/function/arity and by name.
-     Resolves cross-module references through imports, aliases, and `use`-based imports.
+  2. Registry. Makes a function index by module, function name, and arity,
+     and a second index by function name. Finds functions in other modules
+     through imports, aliases, and the imports that `use` adds.
 
-  3. **Resolver** - Parses HEEX content. Extracts static classes and dynamic variants.
-     Resolves `{:fn_call, ...}` references and assign facts captured before `~H`.
-     Emits component calls as graph edges. Computes compact class facts.
+  3. Resolver. Parses the HEEX content into static classes and dynamic
+     variants. Finds the values of `{:fn_call, ...}` references and of the
+     assigns that the function sets before `~H`. Adds an edge for each
+     component call and computes compact class facts.
 
-     Conservative models for Phoenix built-ins:
-     - `<.link>` is an `a` tag (selectors like `.menu a:hover` match without a local definition).
-     - `render_slot(@inner_block)` and named slots are kept in the graph for CSS coverage.
-     - Standalone templates resolve tags like `Layouts.admin_content` by module suffix.
-     - `Phoenix.HTML.raw/1` calls become raw-HTML placeholders. CSS coverage matches one
-       immediate tag-only selector under the HEEX parent (e.g. `.markdown p`),
-       not deep descendants (e.g. `.markdown p strong`).
+     The resolver uses these models for Phoenix components:
+     - `<.link>` is an `a` tag. A selector such as `.menu a:hover` matches
+       it without a local definition.
+     - `render_slot(@inner_block)` and named slots stay in the graph for
+       the CSS coverage check.
+     - Standalone templates find tags such as `Layouts.admin_content` by
+       the last part of the module name.
+     - A `Phoenix.HTML.raw/1` call becomes a placeholder for raw HTML. The
+       CSS coverage check matches one tag selector directly below the HEEX
+       parent, for example `.markdown p`. Deeper selectors, for example
+       `.markdown p strong`, do not match.
 
-  4. **Output** - Writes `analysis/heex-class-graph.json`: entries, canonical trees,
-     cycles, and unresolved refs.
+  4. Output. Writes `analysis/heex-class-graph.json` with the entries,
+     canonical trees, cycles, and unresolved references.
 
-  5. **Summary** - Prints counts of entries, trees, and cycles.
+  5. Summary. Prints the number of entries, trees, and cycles.
 
-  ## Error handling
+  ## Errors
 
-  The resolver builds the graph in a single pass. If resolution fails (malformed HEEX,
-  unexpected AST), the task logs a warning and re-raises the exception.
+  The resolver builds the graph in one pass. A malformed HEEX file or an
+  unknown AST form can make the resolver fail on a template. In that case,
+  the task logs a warning and raises the exception again.
 
-  ## Output structure
+  ## Output
 
-  Graph version 2. Contains public entries, canonical node trees, component cycles,
-  and unresolved refs. See `Mix.Tasks.HeexClassAnalyzer.Output` for the JSON schema.
+  The graph is version 2. It contains the public entries, canonical node
+  trees, component cycles, and unresolved references.
+  `Mix.Tasks.HeexClassAnalyzer.Output` describes the JSON schema.
 
   ## Example
 
@@ -63,10 +73,10 @@ defmodule Mix.Tasks.HeexClassAnalyzer do
 
   ## Submodules
 
-  - `Discovery` - `discover/1`: finds and parses source files.
-  - `Registry` - `build/1`: creates the function lookup index.
-  - `Resolver` - `resolve_graph/2`: produces canonical graph trees.
-  - `Output` - `write_graph!/2`: serializes graph results to JSON.
+  - `Discovery`. `discover/1` finds and parses the source files.
+  - `Registry`. `build/1` makes the function index.
+  - `Resolver`. `resolve_graph/2` makes the canonical graph trees.
+  - `Output`. `write_graph!/2` writes the graph as JSON.
   """
 
   use Mix.Task

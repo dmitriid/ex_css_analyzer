@@ -1,63 +1,63 @@
 defmodule Mix.Tasks.HeexClassAnalyzer.Node do
   @moduledoc """
-  The core data structure for the HEEX class analyzer pipeline.
+  The main data structure of the HEEX class analyzer.
 
-  A `Node` represents a single HTML or Phoenix component element in a parsed
-  HEEX template tree. Each node carries the element's tag name, its CSS class
-  information (split into static classes and dynamic variants), compact class
-  facts for selector matching, and a list of child nodes forming the tree
-  structure.
+  A `Node` is one HTML element or Phoenix component in a parsed HEEX
+  template tree. It contains these items:
 
-  ## Pipeline Role
+  - The tag name of the element
+  - The CSS classes, as static classes and dynamic variants
+  - Compact class facts for selector matches
+  - The child nodes
 
-  `Node` is the universal data structure flowing through the entire analyzer
-  pipeline:
+  ## Use in the analyzer stages
+
+  All analyzer stages use `Node`:
 
       Discovery -> HeexParser -> Expression -> Registry -> Resolver -> Output
 
-  - **HeexParser** produces `Node` trees with `tag` and `static` populated
-    (where `static` may be a raw string, an `{:expr, code}` tuple, or a list).
-  - **Resolver** enriches nodes by running `Expression.analyze/1` on the
-    `static` field to populate `static` (as a list of class strings) and
-    `variants`.
-  - **Resolver** also fills in the `classes` field with compact class facts
-    derived from static classes and variants.
-  - **Output** traverses the tree to render the final class hierarchy.
+  - HeexParser. Makes `Node` trees with data in `tag` and `static`. At this
+    stage, `static` is a raw string, an `{:expr, code}` tuple, or a list.
+  - Resolver. Calls `Expression.analyze/1` on the `static` field. Puts a
+    list of class strings into `static` and the dynamic variants into
+    `variants`. After that, computes the compact class facts in `classes`
+    from the static classes and variants.
+  - Output. Reads the tree and writes the final class hierarchy.
 
   ## Fields
 
-  - `:tag` - The element tag name. For HTML elements this is the tag (e.g.,
-    `"div"`, `"span"`). For Phoenix function components it is the dotted name
-    (e.g., `".button"`, `"CoreComponents.icon"`). For slots it is prefixed
-    with a colon (e.g., `":inner_block"`). `nil` if unknown.
+  - `:tag`. The tag name of the element, or `nil` if it is unknown:
+    - An HTML element has its tag, for example `"div"` or `"span"`.
+    - A Phoenix function component has its dotted name, for example
+      `".button"` or `"CoreComponents.icon"`.
+    - A slot has a colon prefix, for example `":inner_block"`.
 
-  - `:static` - A list of CSS class strings that are always applied to this
-    element. During parsing, this field temporarily holds the raw class
-    attribute value (a string or `{:expr, code}` tuple) before the Resolver
-    stage processes it into a proper list.
+  - `:static`. The CSS class strings that always apply to this element.
+    During parsing, this field contains the raw class attribute value, a
+    string or an `{:expr, code}` tuple. The Resolver stage changes this
+    value to a list.
 
-  - `:variants` - A list of dynamic class variants. Each variant is one of:
-    - `{:toggle, classes}` - A class string conditionally applied (from `&&`
-      expressions or `if` without `else`). The classes may or may not be
-      present.
-    - `{:either, [option1, option2, ...]}` - Mutually exclusive class strings
-      (from `if/else`, `case`, `cond`, or `||` expressions). Exactly one of
-      the options will be applied at runtime.
+  - `:variants`. The dynamic class variants. Each variant is one of these
+    forms:
+    - `{:toggle, classes}`. A class string that applies only on a
+      condition. `&&` expressions and `if` without `else` give this form.
+    - `{:either, [option1, option2, ...]}`. Class strings that exclude each
+      other. `if/else`, `case`, `cond`, and `||` expressions give this
+      form. At runtime, exactly one option applies.
 
-  - `:classes` - Compact class facts describing always-present static classes,
-    optional classes, mutually exclusive branch options, and dynamic class
-    sources.
+  - `:classes`. Compact class facts with four groups: static classes,
+    optional classes, branch options that exclude each other, and dynamic
+    class sources.
 
-  - `:children` - A list of child `Node` structs or component edge refs
-    forming the tree hierarchy. Corresponds to elements nested within this
-    element in the HEEX template.
+  - `:children`. The child `Node` structs or component edge references. They
+    are the elements in this element in the HEEX template.
 
-  - `:repeat` - Whether the element has a HEEx `:for` attribute and may render
-    multiple sibling copies of itself.
+  - `:repeat`. `true` if the element has a HEEx `:for` attribute. Such an
+    element can render several sibling copies of itself.
 
-  - `:slot_bindings` - Parser-only metadata from HEEx `:for` expressions such
-    as `btn <- @button`, used to bind `render_slot(btn, ...)` back to the
-    named slot `:button` before resolver output is serialized.
+  - `:slot_bindings`. Parser data from HEEx `:for` expressions such as
+    `btn <- @button`. The resolver uses it to link `render_slot(btn, ...)`
+    to the named slot `:button` before it writes the output.
 
   ## Examples
 

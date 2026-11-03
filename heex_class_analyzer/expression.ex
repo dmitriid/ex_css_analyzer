@@ -1,31 +1,30 @@
 defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   @moduledoc """
-  Analyzes class attribute values by parsing Elixir AST to classify CSS classes
-  as static, toggle variants, either variants, or function calls.
+  Parses the Elixir AST of class attribute values. Sorts the CSS classes into
+  static classes, toggle variants, either variants, and function calls.
 
-  This module is the third stage in the analyzer pipeline, responsible for
-  understanding what CSS classes an element can have at runtime by examining
-  the Elixir expression used in its `class` attribute.
+  Expression is the third analyzer stage. It finds the CSS classes that an
+  element can have at runtime from the Elixir expression in its `class`
+  attribute.
 
-  ## Pipeline Role
+  ## Stage order
 
       Discovery -> HeexParser -> **Expression** -> Registry -> Resolver -> ClassFacts -> Output
 
-  The `Expression` module is called by the `Resolver` on each node's class
-  attribute value. It takes the raw class value (a plain string, an
-  `{:expr, code}` tuple, or `nil`) and returns a tuple of
-  `{static_classes, variants}` that the Resolver uses to populate the node's
-  `:static` and `:variants` fields.
+  The `Resolver` calls `analyze/1` on the class attribute value of each node.
+  The value is a plain string, an `{:expr, code}` tuple, or `nil`. The
+  result is a `{static_classes, variants}` tuple. The `Resolver` puts this
+  tuple into the `:static` and `:variants` fields of the node.
 
-  Additionally, the `Resolver` uses `extract_returns/1` to analyze function
-  bodies and determine what class values they might return, enabling
-  cross-function resolution of dynamic class expressions.
+  The `Resolver` also uses `extract_returns/1` to find the class values that
+  a function body can return. With these values, the `Resolver` follows
+  dynamic class expressions into other functions.
 
   ## Public API
 
   ### `analyze/1`
 
-  Analyzes a class attribute value and returns `{static_classes, variants}`.
+  Returns the `{static_classes, variants}` tuple for a class attribute value.
 
       @spec analyze(String.t() | {:expr, String.t()} | nil) :: {[String.t()], [variant()]}
 
@@ -65,20 +64,20 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
 
   ### `extract_returns/1`
 
-  Analyzes an Elixir AST and extracts all possible return values from a
-  function body. Used by the `Resolver` to determine what classes a helper
-  function might return.
+  Finds all possible return values of a function body. The `Resolver`
+  uses the result to find the classes that a helper function can return.
 
       @spec extract_returns(Macro.t()) :: {:ok, [term()]} | :unresolved
 
-  Returns `{:ok, list_of_possible_returns}` where each return value is either:
-  - A list of class strings (e.g., `["flex", "gap-2"]`)
-  - `["<dynamic>"]` for values that cannot be statically determined
-  - `{:fn_call, {module, func, args}}` or `{:fn_call, {func, args}}` for
-    nested function calls that need further resolution
+  The result is `{:ok, list_of_possible_returns}`. Each return value is one
+  of these items:
+  - A list of class strings, for example `["flex", "gap-2"]`
+  - `["<dynamic>"]` for a value that static analysis cannot find
+  - `{:fn_call, {module, func, args}}` or `{:fn_call, {func, args}}` for a
+    nested function call that the `Resolver` must analyze next
 
-  Returns `:unresolved` if the function body cannot be analyzed.
-
+  If the analyzer cannot read the function body, the result is
+  `:unresolved`.
   #### Examples
 
       iex> {:ok, ast} = Code.string_to_quoted(~S("flex gap-2"))
@@ -93,36 +92,36 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
       iex> Expression.extract_returns(ast)
       {:ok, [["red"], ["blue"]]}
 
-  ## Variant Types
+  ## Variant types
 
-  The `variant()` type represents a dynamic class expression:
+  The `variant()` type is a dynamic class expression:
 
-  - `{:toggle, class_string}` - A class that is conditionally present or
-    absent. Produced by `&&` expressions and `if` without `else`. The string
-    may contain multiple space-separated classes.
+  - `{:toggle, class_string}`. A class that is present or absent at
+    runtime. `&&` expressions and `if` without `else` give this variant.
+    The string can contain several classes with spaces between them.
 
-  - `{:either, [option1, option2, ...]}` - Mutually exclusive class options.
-    Exactly one will be active at runtime. Produced by `if/else`, `case`,
-    `cond`, and `||` expressions. Each option is a class string (possibly
-    multi-word). The special value `"<dynamic>"` represents an option that
-    cannot be statically determined.
+  - `{:either, [option1, option2, ...]}`. Class options that exclude each
+    other. At runtime, exactly one option applies. `if/else`, `case`,
+    `cond`, and `||` expressions give this variant. Each option is a class
+    string with one or more classes. The value `"<dynamic>"` is an option
+    that static analysis cannot find.
 
-  - `{:fn_call, {func_name, args}}` - A local function call whose return
-    value determines the classes. The `Resolver` attempts to look up the
-    function in the `Registry` and recursively analyze its body via
-    `extract_returns/1`.
+  - `{:fn_call, {func_name, args}}`. A local function call. The return
+    value of the call sets the classes. The `Resolver` finds the function
+    in the `Registry` and analyzes its body with `extract_returns/1`.
 
-  - `{:fn_call, {module, func_name, args}}` - A remote function call
-    (e.g., `MyModule.class_helper(arg)`). Handled similarly to local calls
-    by the `Resolver`.
+  - `{:fn_call, {module, func_name, args}}`. A remote function call, for
+    example `MyModule.class_helper(arg)`. The `Resolver` handles it as a
+    local call.
 
-  - `{:assign_ref, assign_name}` - A HEEX assign reference such as `@tie_class`.
-    The `Resolver` may replace it with clause-local assign facts discovered
-    before the `~H` sigil.
+  - `{:assign_ref, assign_name}`. A HEEX assign reference such as
+    `@tie_class`. If the function clause sets this assign before the `~H`
+    sigil, the `Resolver` replaces the reference with the assign facts.
 
-  ## Expression Classification Rules
+  ## Expression rules
 
-  The analyzer walks the Elixir AST and classifies expressions as follows:
+  The analyzer reads the Elixir AST and sorts each expression into one of
+  these classifications:
 
   | Expression Pattern            | Classification                        |
   |-------------------------------|---------------------------------------|
@@ -140,39 +139,37 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   | variable                     | Static `["<dynamic>"]`                |
   | Unparseable                  | Static `["<dynamic>"]`                |
 
-  ## Edge Cases and Special Behaviors
+  ## Special cases
 
-  - **`"<dynamic>"` sentinel**: When the analyzer cannot determine the actual
-    class value (e.g., a bare variable or module attribute), it uses the
-    string `"<dynamic>"` as a placeholder. This propagates through to the
-    output so that users can see which elements have unresolvable classes.
+  - `"<dynamic>"`. If the analyzer cannot find the class value, for
+    example for a variable or a module attribute, it uses the string
+    `"<dynamic>"`. This string goes into the output and shows the elements
+    with unknown classes.
 
-  - **String concatenation in `extract_returns`**: Expressions like
-    `"prefix-" <> "suffix"` are evaluated at analysis time to produce the
-    concatenated result. Non-string operands cause the expression to be
-    marked `:unresolved`.
+  - String concatenation in `extract_returns/1`. The analyzer joins
+    expressions such as `"prefix-" <> "suffix"` into one string. If an
+    operand is not a string, the result is `:unresolved`.
 
-  - **Block expressions**: For multi-expression blocks (`__block__`), only
-    the last expression is considered as the return value (matching Elixir
-    semantics).
+  - Block expressions. In a block of several expressions (`__block__`),
+    only the last expression is the return value. Elixir uses the same rule.
 
-  - **`nil` branches**: An `if` with no `else` clause returns `nil` for the
-    else branch, which `extract_returns/1` maps to an empty class list `[]`.
+  - `nil` branches. An `if` without `else` returns `nil` for the missing
+    branch. `extract_returns/1` changes this `nil` to an empty class list.
 
-  - **Lists in `extract_returns`**: List literals are returned as-is, with
-    non-string elements replaced by `"<dynamic>"`.
+  - Lists in `extract_returns/1`. The function returns list literals
+    without changes. Each item that is not a string becomes `"<dynamic>"`.
 
-  - **Nested conditionals**: Both `analyze/1` and `extract_returns/1` handle
-    nested `if`/`case`/`cond` by recursively collecting branch values.
+  - Nested conditionals. `analyze/1` and `extract_returns/1` collect the
+    branch values of nested `if`, `case`, and `cond` expressions.
 
-  ## Interaction with Other Modules
+  ## Related modules
 
-  - **Called by**: `Resolver` (calls `analyze/1` on each node's class value
-    and `extract_returns/1` on function bodies found via the `Registry`).
-  - **Produces**: `{static_classes, variants}` tuples consumed by
-    `ClassFacts.from_static_and_variants/2` to generate compact selector facts.
-  - **Depends on**: Standard library `Code.string_to_quoted/1` for parsing
-    expression strings into AST.
+  - `Resolver`. Calls `analyze/1` on the class value of each node. Calls
+    `extract_returns/1` on the function bodies from the `Registry`.
+  - `ClassFacts`. `ClassFacts.from_static_and_variants/2` makes compact
+    selector facts from the `{static_classes, variants}` tuples.
+  - `Code`. `Code.string_to_quoted/1` parses the expression strings into
+    AST.
   """
 
   @type variant ::
