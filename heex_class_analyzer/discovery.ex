@@ -513,7 +513,6 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
 
   defp assign_step_fact(_step), do: %{}
 
-  # `assign_new/3` sets the assign to the return value of the default function.
   defp assign_new_fact(assign_name, {:fn, _, [{:->, _, [_args, body]}]}),
     do: assign_fact_from_name(assign_name, body)
 
