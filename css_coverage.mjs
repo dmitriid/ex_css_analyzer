@@ -53,6 +53,7 @@
  *    --max-contexts <n>     Maximum rendered contexts to expand before failing (default: 250000)
  *    --include-node-modules-css
  *                          Include selectors from CSS imported from node_modules
+ *    --fail-on-unmatched    Exit with status 1 if there are unmatched selectors or unused keyframes
  *    --help              Show usage information
  *
  *    All paths are resolved relative to the project root (detected by walking
@@ -230,6 +231,19 @@
  * path, the selector is classified as "possibly_dynamic" with metadata about
  * which part was unresolved.
  *
+ * IGNORE COMMENTS
+ * ---------------
+ * A comment that starts with `@@ignore` excludes the next rule or @keyframes
+ * from the check. The text after `@@ignore` is the reason:
+ *
+ *   /* @@ignore The PDF viewer hook creates this element *\/
+ *   .pdf-text-layer .markedContent { ... }
+ *
+ * The comment must be immediately before the rule. It applies to all
+ * comma-separated selectors of that rule. The report puts ignored selectors
+ * and keyframes in the "ignored" category. The mutation flags do not change them, and
+ * `--fail-on-unmatched` does not count them.
+ *
  * MUTATION FLAGS
  * --------------
  * `--remove-unmatched`, `--invalidate-unmatched`, and `--restore-unmatched`
@@ -284,6 +298,7 @@ function parseArgs() {
     stats: false,
     maxContexts: 250000,
     includeNodeModulesCss: false,
+    failOnUnmatched: false,
     jsPaths: [],
   };
 
@@ -301,6 +316,7 @@ function parseArgs() {
   --stats                      Print graph/context analysis statistics
   --max-contexts <n>           Maximum rendered contexts to expand before failing (default: 250000)
   --include-node-modules-css   Include selectors from CSS imported from node_modules
+  --fail-on-unmatched          Exit with status 1 if there are unmatched selectors or unused keyframes
   --help                    Show this message`;
 
   for (let i = 0; i < args.length; i++) {
@@ -335,6 +351,8 @@ function parseArgs() {
       opts.maxContexts = parsePositiveIntegerFlag(arg, args[++i]);
     } else if (arg === "--include-node-modules-css") {
       opts.includeNodeModulesCss = true;
+    } else if (arg === "--fail-on-unmatched") {
+      opts.failOnUnmatched = true;
     } else {
       console.error(`Unknown option: ${arg}\n`);
       console.error(HELP);
@@ -379,6 +397,19 @@ const SKIP_AT_RULES = new Set([
 const UNMATCHED_PREFIX = "____unmatched___";
 const UNMATCHED_MARKER = "." + UNMATCHED_PREFIX;
 const PHOENIX_RUNTIME_CLASSES = ["phx-drop-target-active"];
+const IGNORE_DIRECTIVE = /^@@ignore(?:\s+([\s\S]*))?$/;
+
+/**
+ * Return the reason text of an `@@ignore` comment immediately before `node`.
+ * Return null if the previous node is not an `@@ignore` comment.
+ */
+function ignoreReason(node) {
+  const previous = node.prev();
+  if (!previous || previous.type !== "comment") return null;
+
+  const match = IGNORE_DIRECTIVE.exec(previous.text.trim());
+  return match ? (match[1] || "").trim() : null;
+}
 
 /**
  * Parse a CSS file and return an array of parsed selector descriptors.
@@ -476,6 +507,7 @@ async function parseCss(cssPath, projectRoot, opts = {}) {
       node.source && node.source.input && node.source.input.file
         ? relative(projectRoot, node.source.input.file)
         : relCssPath;
+    const reason = ignoreReason(node);
 
     // Parse the selector
     try {
@@ -486,6 +518,17 @@ async function parseCss(cssPath, projectRoot, opts = {}) {
 
         // Skip previously invalidated selectors
         if (selectorText.includes(UNMATCHED_MARKER)) {
+          continue;
+        }
+
+        if (reason !== null) {
+          selectors.push({
+            selectorText,
+            file: sourceFile,
+            line,
+            segments: null,
+            ignoreReason: reason,
+          });
           continue;
         }
 
@@ -844,14 +887,19 @@ function analyzeKeyframes(cssPath, projectRoot) {
   const declarations = new Map();
   const references = new Set();
   const invalidated = [];
+  const ignored = [];
 
   root.walkAtRules("keyframes", (atRule) => {
     const name = atRule.params;
     const line = atRule.source && atRule.source.start ? atRule.source.start.line : null;
 
+    const reason = ignoreReason(atRule);
+
     if (name.startsWith(UNMATCHED_PREFIX)) {
       const originalName = name.replace(UNMATCHED_PREFIX, "");
       invalidated.push({ name: originalName, file: relCssPath, line });
+    } else if (reason !== null) {
+      ignored.push({ name, file: relCssPath, line, reason });
     } else {
       declarations.set(name, { file: relCssPath, line, node: atRule });
     }
@@ -871,7 +919,7 @@ function analyzeKeyframes(cssPath, projectRoot) {
     }
   });
 
-  return { declarations, references, invalidated };
+  return { declarations, references, invalidated, ignored };
 }
 
 /**
@@ -1817,6 +1865,7 @@ function matchSelectors(parsedSelectors, graphIndex, runtimeEvidence = new Map()
   const possiblyDynamic = [];
   const unmatched = [];
   const skipped = [];
+  const ignored = [];
   graphIndex.stats.selectorCount = parsedSelectors.length;
 
   // Deduplicate selectors — same selector text can appear in multiple rules,
@@ -1824,6 +1873,16 @@ function matchSelectors(parsedSelectors, graphIndex, runtimeEvidence = new Map()
   const seen = new Set();
 
   for (const sel of parsedSelectors) {
+    if (sel.ignoreReason !== undefined) {
+      ignored.push({
+        selector: sel.selectorText,
+        file: sel.file,
+        line: sel.line,
+        reason: sel.ignoreReason,
+      });
+      continue;
+    }
+
     if (sel.segments === null) {
       skipped.push({
         selector: sel.selectorText,
@@ -1899,6 +1958,7 @@ function matchSelectors(parsedSelectors, graphIndex, runtimeEvidence = new Map()
     possibly_dynamic: possiblyDynamic,
     unmatched,
     skipped,
+    ignored,
   };
 }
 
@@ -2523,8 +2583,10 @@ async function main() {
     unmatched: results.unmatched,
     unmatched_selectors: results.unmatched.map((entry) => entry.selector),
     skipped: results.skipped,
+    ignored: results.ignored,
     invalidated_selectors: invalidatedSelectors,
     unused_keyframes: unusedKeyframes,
+    ignored_keyframes: keyframeAnalysis.ignored,
     cycles: graphIndex.cycles || [],
     unresolved_refs: graphIndex.unresolvedRefs || [],
     analysis_stats: analysisStats,
@@ -2535,9 +2597,11 @@ async function main() {
       invalidated: invalidatedSelectors.length,
       possibly_dynamic: results.possibly_dynamic.length,
       skipped: results.skipped.length,
+      ignored: results.ignored.length,
       keyframes_total: keyframeAnalysis.declarations.size,
       keyframes_unused: unusedKeyframes.length,
       keyframes_invalidated: keyframeAnalysis.invalidated.length,
+      keyframes_ignored: keyframeAnalysis.ignored.length,
       cycles: graphIndex.cycles.length,
       unresolved_refs: graphIndex.unresolvedRefs.length,
     },
@@ -2547,11 +2611,11 @@ async function main() {
 
   const s = output.summary;
   console.log(
-    `CSS Coverage: ${s.matched} matched, ${s.runtime_matched} runtime-matched, ${s.unmatched} unmatched, ${s.invalidated} invalidated, ${s.possibly_dynamic} possibly dynamic, ${s.skipped} skipped`
+    `CSS Coverage: ${s.matched} matched, ${s.runtime_matched} runtime-matched, ${s.unmatched} unmatched, ${s.invalidated} invalidated, ${s.possibly_dynamic} possibly dynamic, ${s.skipped} skipped, ${s.ignored} ignored`
   );
-  if (keyframeAnalysis.declarations.size > 0) {
+  if (keyframeAnalysis.declarations.size > 0 || keyframeAnalysis.ignored.length > 0) {
     console.log(
-      `Keyframes: ${keyframeAnalysis.declarations.size} found, ${unusedKeyframes.length} unused, ${keyframeAnalysis.invalidated.length} invalidated`
+      `Keyframes: ${keyframeAnalysis.declarations.size} found, ${unusedKeyframes.length} unused, ${keyframeAnalysis.invalidated.length} invalidated, ${keyframeAnalysis.ignored.length} ignored`
     );
   }
   if (output.cycles.length > 0 || output.unresolved_refs.length > 0) {
@@ -2633,6 +2697,14 @@ async function main() {
     console.log(`Removed ${removed} unused selectors from ${relative(projectRoot, cssPath)}`);
     const removedKf = removeUnmatchedKeyframes(cssPath, unusedKeyframes, projectRoot);
     console.log(`Removed ${removedKf} unused keyframes from ${relative(projectRoot, cssPath)}`);
+  }
+
+  if (opts.failOnUnmatched && (results.unmatched.length > 0 || unusedKeyframes.length > 0)) {
+    console.error(
+      `CSS coverage check failed: ${results.unmatched.length} unmatched selectors, ${unusedKeyframes.length} unused keyframes. ` +
+        "Delete each unused rule, or put an `/* @@ignore <reason> */` comment immediately before it."
+    );
+    process.exitCode = 1;
   }
 }
 

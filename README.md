@@ -79,6 +79,15 @@ node lib/mix/tasks/css_coverage.mjs --stats
 node lib/mix/tasks/css_coverage.mjs --output analysis/css-coverage.json
 ```
 
+To use the coverage report as a check, add `--fail-on-unmatched`:
+
+```bash
+node lib/mix/tasks/css_coverage.mjs --list-unmatched --fail-on-unmatched
+```
+
+If the report contains unmatched selectors or unused keyframes, the script exits with status 1.
+Rules with an [`@@ignore` comment](#ignore-comments) do not cause a failure.
+
 Destructive cleanup flags operate only on actual unmatched selectors and unused
 keyframes. Runtime-matched selectors are not removed or invalidated.
 
@@ -176,6 +185,7 @@ Report buckets:
 - `unmatched`: no static, dynamic, or runtime evidence explains the selector.
 - `skipped`: selectors that are not class-matchable, such as `:root` or
   element-only selectors.
+- `ignored`: selectors of rules with an [`@@ignore` comment](#ignore-comments).
 
 Runtime evidence comes from:
 
@@ -188,6 +198,35 @@ Runtime evidence can satisfy missing class names, but it cannot invent DOM
 structure. For example, `.display-uploaded-player .plyr` can be
 `runtime_matched` if `.display-uploaded-player` is in HEEX and `.plyr` comes
 from package CSS, but a selector with no HEEX-supported path remains unmatched.
+
+## Ignore Comments
+
+The analyzer cannot find some elements that exist only at runtime.
+Examples are elements that a JS hook creates and HTML that the server inserts as a string.
+The report shows the selectors for these elements as unmatched.
+The rules are in use.
+
+To exclude a rule from the check, put an `@@ignore` comment immediately before it.
+Write the reason after `@@ignore`:
+
+```css
+/* @@ignore The PDF viewer hook creates this element */
+.pdf-text-layer .markedContent {
+  position: absolute;
+}
+```
+
+The comment has these effects:
+
+- Comma-separated selectors. The comment applies to all selectors of the rule.
+- Nested rules. The comment also works inside `@media` and other at-rules.
+- Keyframes. A comment before `@keyframes` removes the keyframes from the list of unused keyframes.
+- Report. The JSON report lists ignored selectors in `ignored` and ignored keyframes in `ignored_keyframes`.
+  The summary line shows the number of ignored selectors.
+- Cleanup flags. `--remove-unmatched` and `--invalidate-unmatched` do not change ignored rules.
+
+A comment applies only to the rule immediately after it.
+If another rule or a different comment is between the `@@ignore` comment and the rule, the comment has no effect.
 
 ## Pseudo-Selectors
 
@@ -218,6 +257,19 @@ CSS source:
 Use `--invalidate-unmatched` first if you want a reversible browser check. It
 prefixes unmatched selectors with `____unmatched___`; `--restore-unmatched`
 removes that marker.
+
+## Tests
+
+The integration tests in `test/css_coverage.test.mjs` run `css_coverage.mjs` in temporary projects.
+The tests need a `node_modules` directory with `postcss`, `postcss-import`, and `postcss-selector-parser`.
+
+To run the tests, set `CSS_COVERAGE_NODE_MODULES` to that directory:
+
+```bash
+CSS_COVERAGE_NODE_MODULES=../my_app/node_modules node --test test/*.test.mjs
+```
+
+If the variable is not set, the tests are skipped.
 
 ## Plans
 
