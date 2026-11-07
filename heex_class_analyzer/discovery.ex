@@ -420,26 +420,104 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Discovery do
 
   defp contains_heex_sigil?(ast), do: not is_nil(find_first_node(ast, &heex_sigil_node?/1))
 
+  # The facts map each assign name to its value AST. The bindings map each
+  # local variable with a map literal value to the values of that map. The
+  # function replaces a `Map.fetch!/2`, `Map.get/2`, `Map.get/3`, or `Access`
+  # lookup in such a map with a `case` of the map values. `Expression` reads
+  # one exclusive option for each clause of the `case`.
   defp extract_heex_assign_facts(statements) do
-    Enum.reduce(statements, %{}, fn statement, acc ->
-      Map.merge(acc, assign_fact(statement))
+    {facts, _bindings} =
+      Enum.reduce(statements, {%{}, %{}}, fn statement, {facts, bindings} ->
+        facts =
+          statement
+          |> assign_fact()
+          |> Map.new(fn {name, expr} -> {name, replace_map_lookups(expr, bindings)} end)
+          |> then(&Map.merge(facts, &1))
+
+        {facts, Map.merge(bindings, map_binding(statement))}
+      end)
+
+    facts
+  end
+
+  defp map_binding({:=, _, [{name, _, context}, {:%{}, _, pairs}]})
+       when is_atom(name) and is_atom(context) and is_list(pairs) do
+    if Enum.all?(pairs, &match?({_key, _value}, &1)),
+      do: %{name => Enum.map(pairs, fn {_key, value} -> value end)},
+      else: %{}
+  end
+
+  defp map_binding(_statement), do: %{}
+
+  defp replace_map_lookups(expr, bindings) when map_size(bindings) == 0, do: expr
+
+  defp replace_map_lookups(expr, bindings) do
+    Macro.prewalk(expr, fn ast ->
+      case map_lookup(ast, bindings) do
+        {:ok, values} -> values_case(values)
+        :error -> ast
+      end
     end)
   end
 
-  defp assign_fact(
-         {:=, _,
-          [{:assigns, _, _}, {:|>, _, [_assigns_ast, {:assign, _, [assign_name_ast, expr_ast]}]}]}
-       ) do
-    assign_fact_from_name(assign_name_ast, expr_ast)
+  defp map_lookup(
+         {{:., _, [{:__aliases__, _, [:Map]}, fun]}, _, [{name, _, context}, _key]},
+         bindings
+       )
+       when fun in [:fetch!, :get] and is_atom(name) and is_atom(context),
+       do: Map.fetch(bindings, name)
+
+  defp map_lookup(
+         {{:., _, [{:__aliases__, _, [:Map]}, :get]}, _, [{name, _, context}, _key, default]},
+         bindings
+       )
+       when is_atom(name) and is_atom(context) do
+    with {:ok, values} <- Map.fetch(bindings, name), do: {:ok, values ++ [default]}
   end
 
-  defp assign_fact(
-         {:=, _, [{:assigns, _, _}, {:assign, _, [{:assigns, _, _}, assign_name_ast, expr_ast]}]}
-       ) do
-    assign_fact_from_name(assign_name_ast, expr_ast)
+  defp map_lookup({{:., _, [Access, :get]}, _, [{name, _, context}, _key]}, bindings)
+       when is_atom(name) and is_atom(context),
+       do: Map.fetch(bindings, name)
+
+  defp map_lookup(_ast, _bindings), do: :error
+
+  defp values_case(values) do
+    {:case, [], [nil, [do: Enum.map(values, &{:->, [], [[{:_, [], nil}], &1]})]]}
+  end
+
+  defp assign_fact({:=, _, [{:assigns, _, _}, value]}) do
+    value
+    |> assign_steps([])
+    |> Enum.reduce(%{}, &Map.merge(&2, assign_step_fact(&1)))
   end
 
   defp assign_fact(_statement), do: %{}
+
+  # Returns the `assign` and `assign_new` calls of a pipe chain, in pipe
+  # order. A direct call is a chain with one step. The walk stops at the
+  # first value that is not an `assign` or `assign_new` call.
+  defp assign_steps({:|>, _, [left, {fun, _, args}]}, steps)
+       when fun in [:assign, :assign_new] and is_list(args),
+       do: assign_steps(left, [{fun, args} | steps])
+
+  defp assign_steps({fun, _, [left | args]}, steps) when fun in [:assign, :assign_new],
+    do: assign_steps(left, [{fun, args} | steps])
+
+  defp assign_steps(_ast, steps), do: steps
+
+  defp assign_step_fact({:assign, [assign_name, expr]}),
+    do: assign_fact_from_name(assign_name, expr)
+
+  defp assign_step_fact({:assign_new, [assign_name, default_fn]}),
+    do: assign_new_fact(assign_name, default_fn)
+
+  defp assign_step_fact(_step), do: %{}
+
+  # `assign_new/3` sets the assign to the return value of the default function.
+  defp assign_new_fact(assign_name, {:fn, _, [{:->, _, [_args, body]}]}),
+    do: assign_fact_from_name(assign_name, body)
+
+  defp assign_new_fact(_assign_name, _default_fn), do: %{}
 
   defp assign_fact_from_name(assign_name, expr_ast) when is_atom(assign_name) do
     %{assign_name => expr_ast}

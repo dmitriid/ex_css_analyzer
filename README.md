@@ -168,6 +168,35 @@ The analyzer also handles several Phoenix-specific cases:
   HEEX parent, such as `.markdown p`. It does not assume arbitrary classes, IDs,
   or deep descendants.
 
+A function component can set an assign before its `~H` template and use the
+assign in a `class` attribute. The analyzer reads these forms of the assign
+value:
+
+- `assign/3` and `assign_new/3`. A direct call or a pipe chain from `assigns`.
+  For `assign_new/3`, the analyzer reads the return value of the default
+  function.
+- Value types. A string, a list, `&&`, `||`, `if`, `case`, `cond`, and a call to
+  a function with class return values.
+- Map lookups. A local variable with a map literal value, and a lookup with
+  `Map.fetch!/2`, `Map.get/2`, `Map.get/3`, or `variable[key]`. Each map value
+  becomes one exclusive option. `Map.get/3` adds the default value as an option.
+
+```elixir
+def button(assigns) do
+  variants = %{"primary" => "btn-primary", nil => "btn-outline"}
+
+  assigns =
+    assign_new(assigns, :class, fn ->
+      ["btn", Map.fetch!(variants, assigns[:variant]), assigns[:compact] && "btn-compact"]
+    end)
+
+  ~H"<button class={@class}>{render_slot(@inner_block)}</button>"
+end
+```
+
+For this component, `btn` is static, `btn-compact` is optional, and
+`btn-primary` and `btn-outline` are exclusive options.
+
 ## CSS Coverage
 
 `css_coverage.mjs` parses CSS with PostCSS and matches selectors right-to-left
@@ -270,6 +299,14 @@ CSS_COVERAGE_NODE_MODULES=../my_app/node_modules node --test test/*.test.mjs
 ```
 
 If the variable is not set, the tests are skipped.
+
+The integration tests in `test/heex_class_analyzer_test.exs` parse Elixir
+source with the HEEX analyzer modules. The test script compiles the modules
+and needs only Elixir:
+
+```bash
+elixir test/heex_class_analyzer_test.exs
+```
 
 ## Plans
 

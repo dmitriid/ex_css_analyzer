@@ -814,6 +814,24 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
   defp assign_expr_to_resolution(nil, _calling_module, _registry, _visited_fns, _depth),
     do: {:statics, []}
 
+  # A list or a conditional value uses the same rules as a `class` attribute.
+  # The function calls in the value are resolved with an empty assign map, so
+  # an assign value cannot refer to itself.
+  defp assign_expr_to_resolution(ast, calling_module, registry, visited_fns, depth)
+       when is_list(ast) or
+              (is_tuple(ast) and tuple_size(ast) == 3 and
+                 elem(ast, 0) in [:&&, :||, :if, :case, :cond]) do
+    {statics, variants} = Expression.analyze({:expr, Macro.to_string(ast)})
+    statics = stamp_direct_dynamics(statics)
+
+    {resolved_variants, resolved_statics} =
+      variants
+      |> stamp_direct_variant_dynamics()
+      |> resolve_class_variants(%{}, calling_module, registry, visited_fns, depth + 1)
+
+    {:classes, statics ++ resolved_statics, resolved_variants}
+  end
+
   defp assign_expr_to_resolution(
          {func_name, _meta, args},
          calling_module,
@@ -853,6 +871,9 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
 
   defp merge_resolved({:statics, new_statics}, {var_acc, static_acc}),
     do: {var_acc, static_acc ++ new_statics}
+
+  defp merge_resolved({:classes, new_statics, new_variants}, {var_acc, static_acc}),
+    do: {var_acc ++ new_variants, static_acc ++ new_statics}
 
   defp resolve_fn_call(_fn_ref, _calling_module, _registry, _visited, depth, chain)
        when depth >= @max_depth do
