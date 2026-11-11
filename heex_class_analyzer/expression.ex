@@ -443,15 +443,12 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
   defp extract_local_call_return(func_name, args), do: [{:fn_call, {func_name, args}}]
 
   defp extract_from_clauses(clauses) when is_list(clauses) do
-    results =
-      Enum.reduce_while(clauses, [], fn {:->, _, [_pattern, body]}, acc ->
-        case do_extract_returns(body) do
-          :unresolved -> {:halt, :unresolved}
-          values -> {:cont, acc ++ values}
-        end
-      end)
-
-    results
+    Enum.reduce_while(clauses, [], fn {:->, _, [_pattern, body]}, acc ->
+      case do_extract_returns(body) do
+        :unresolved -> {:halt, :unresolved}
+        values -> {:cont, acc ++ values}
+      end
+    end)
   end
 
   defp extract_from_clauses(_), do: :unresolved
@@ -471,13 +468,12 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Expression do
 
   defp collect_branch_strings(nil), do: []
 
-  defp collect_branch_strings(ast) do
-    case ast do
-      str when is_binary(str) -> [str]
-      {:__block__, _, exprs} -> exprs |> List.last() |> collect_branch_strings()
-      _ -> []
-    end
-  end
+  defp collect_branch_strings(str) when is_binary(str), do: [str]
+
+  defp collect_branch_strings({:__block__, _, exprs}),
+    do: exprs |> List.last() |> collect_branch_strings()
+
+  defp collect_branch_strings(_), do: []
 
   defp collect_class_values(str) when is_binary(str), do: [str]
 

@@ -322,10 +322,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Registry do
     registry.modules
     |> Map.keys()
     |> Enum.filter(fn module ->
-      module
-      |> Module.split()
-      |> Enum.take(-suffix_length)
-      |> Kernel.==(target_suffix)
+      Enum.take(Module.split(module), -suffix_length) == target_suffix
     end)
     |> Enum.find_value(&find_in_module(registry, &1, func_name))
   end

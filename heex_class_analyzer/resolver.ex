@@ -594,11 +594,8 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
   defp function_returns_phoenix_raw?(entry, registry, seen \\ MapSet.new()) do
     key = {entry.module, entry.function.name, entry.function.arity}
 
-    if MapSet.member?(seen, key) do
-      false
-    else
+    not MapSet.member?(seen, key) and
       function_clauses_return_phoenix_raw?(entry, registry, MapSet.put(seen, key))
-    end
   end
 
   defp function_clauses_return_phoenix_raw?(entry, registry, seen) do
@@ -742,7 +739,7 @@ defmodule Mix.Tasks.HeexClassAnalyzer.Resolver do
 
     state =
       refs
-      |> Enum.with_index()
+      |> Stream.with_index()
       |> Enum.reduce(state, fn {target_ref, clause_index}, acc ->
         if target_ref in stack do
           cycle = %{type: "component", path: Enum.reverse([target_ref | stack])}
